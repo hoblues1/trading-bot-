@@ -213,7 +213,6 @@ class ExchangePositionSync:
                 if current_side == side and current_entry == round(entry, 8) and current_size == round(size, 8):
                     return
 
-                # drift 발생 시 overwrite 가능하면 overwrite, 아니면 close 후 reopen
                 if hasattr(self.pnl_engine, "close_position"):
                     mark_price = None
                     if hasattr(self.pnl_engine, "last_price") and isinstance(self.pnl_engine.last_price, dict):

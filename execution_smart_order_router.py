@@ -33,6 +33,8 @@ class SmartOrderRouter:
     8) accepted/new 상태는 진짜 성공과 구분해서 처리
     9) duplicate pre-register 후 실패 시 rollback
     10) years-long 운용용 snapshot / metrics 유지
+    11) capital_mode 기반으로 초소액 / 방어 / 성장 모드별 routing 보정
+    12) 너무 과보수적으로 막아 거래가 죽지 않게 실전형 밸런스 유지
     """
 
     SUCCESS_STATUSES = {
@@ -71,20 +73,20 @@ class SmartOrderRouter:
         self.last_route_time: Dict[str, float] = {}
 
         self.min_order_interval = 1.20
-        self.same_side_cooldown = 4.00
+        self.same_side_cooldown = 3.20
         self.duplicate_order_cooldown = 1.80
 
-        self.min_open_volatility = 0.0003
+        self.min_open_volatility = 0.00020
         self.market_order_volatility_threshold = 0.010
 
-        self.max_spread_bps_for_market_open = 7.0
-        self.max_spread_bps_for_limit_open = 18.0
+        self.max_spread_bps_for_market_open = 8.5
+        self.max_spread_bps_for_limit_open = 22.0
         self.max_spread_bps_for_market_close = 12.0
-        self.hard_block_spread_bps_for_open = 25.0
+        self.hard_block_spread_bps_for_open = 28.0
 
-        self.min_top_book_notional_ratio = 0.35
-        self.min_second_book_notional_ratio = 0.75
-        self.max_estimated_slippage_bps = 10.0
+        self.min_top_book_notional_ratio = 0.28
+        self.min_second_book_notional_ratio = 0.60
+        self.max_estimated_slippage_bps = 12.0
 
         self.default_split_count = 1
         self.max_split_count = 3
@@ -267,6 +269,57 @@ class SmartOrderRouter:
             "book_pressure": book_pressure,
         }
 
+    def _extract_capital_mode(self, extra_meta: Optional[Dict[str, Any]]) -> str:
+        meta = extra_meta or {}
+        return str(meta.get("capital_mode", "UNKNOWN")).upper().strip()
+
+    def _capital_mode_split_cap(self, capital_mode: str) -> int:
+        if capital_mode == "SURVIVAL":
+            return 1
+        if capital_mode in ("DEFENSIVE", "CAPITAL_PRESERVATION"):
+            return 1
+        if capital_mode == "MICRO_COMPOUND":
+            return 2
+        if capital_mode == "ADAPTIVE_GROWTH":
+            return 3
+        return self.max_split_count
+
+    def _capital_mode_market_open_spread_cap(self, capital_mode: str) -> float:
+        if capital_mode == "SURVIVAL":
+            return min(self.max_spread_bps_for_market_open, 5.5)
+        if capital_mode in ("DEFENSIVE", "CAPITAL_PRESERVATION"):
+            return min(self.max_spread_bps_for_market_open, 6.0)
+        if capital_mode == "MICRO_COMPOUND":
+            return min(self.max_spread_bps_for_market_open, 7.0)
+        return self.max_spread_bps_for_market_open
+
+    def _capital_mode_limit_open_spread_cap(self, capital_mode: str) -> float:
+        if capital_mode == "SURVIVAL":
+            return min(self.max_spread_bps_for_limit_open, 15.0)
+        if capital_mode in ("DEFENSIVE", "CAPITAL_PRESERVATION"):
+            return min(self.max_spread_bps_for_limit_open, 16.0)
+        if capital_mode == "MICRO_COMPOUND":
+            return min(self.max_spread_bps_for_limit_open, 18.0)
+        return self.max_spread_bps_for_limit_open
+
+    def _capital_mode_hard_spread_cap(self, capital_mode: str) -> float:
+        if capital_mode == "SURVIVAL":
+            return min(self.hard_block_spread_bps_for_open, 20.0)
+        if capital_mode in ("DEFENSIVE", "CAPITAL_PRESERVATION"):
+            return min(self.hard_block_spread_bps_for_open, 22.0)
+        if capital_mode == "MICRO_COMPOUND":
+            return min(self.hard_block_spread_bps_for_open, 24.0)
+        return self.hard_block_spread_bps_for_open
+
+    def _capital_mode_estimated_slippage_cap(self, capital_mode: str) -> float:
+        if capital_mode == "SURVIVAL":
+            return min(self.max_estimated_slippage_bps, 7.0)
+        if capital_mode in ("DEFENSIVE", "CAPITAL_PRESERVATION"):
+            return min(self.max_estimated_slippage_bps, 8.0)
+        if capital_mode == "MICRO_COMPOUND":
+            return min(self.max_estimated_slippage_bps, 9.0)
+        return self.max_estimated_slippage_bps
+
     def _normalize_qty(self, symbol: str, qty) -> float:
         try:
             raw_qty = self._safe_float(qty, 0.0)
@@ -311,7 +364,7 @@ class SmartOrderRouter:
             if aggressiveness == "PASSIVE":
                 slip *= 0.55
             elif aggressiveness == "AGGRESSIVE":
-                slip *= 1.25
+                slip *= 1.15
 
             if side == "BUY":
                 return ref_price * (1 + slip)
@@ -408,17 +461,28 @@ class SmartOrderRouter:
         volatility_value: float,
         book_ctx: Dict[str, float],
         quality_style: Optional[Dict[str, Any]] = None,
+        capital_mode: str = "UNKNOWN",
     ) -> str:
         if quality_style and isinstance(quality_style, dict):
             qs = quality_style.get("aggressiveness")
             if qs:
-                return self._normalize_aggressiveness(qs)
+                aggr = self._normalize_aggressiveness(qs)
+                if capital_mode in ("SURVIVAL", "DEFENSIVE", "CAPITAL_PRESERVATION") and aggr == "AGGRESSIVE":
+                    return "BALANCED"
+                return aggr
 
         if action != "OPEN":
             return "AGGRESSIVE"
 
         spread_bps = self._safe_float(book_ctx.get("spread_bps"), 0.0)
         book_pressure = self._safe_float(book_ctx.get("book_pressure"), 0.0)
+
+        if capital_mode in ("SURVIVAL", "DEFENSIVE", "CAPITAL_PRESERVATION"):
+            if spread_bps >= 3.5:
+                return "PASSIVE"
+            if volatility_value >= self.market_order_volatility_threshold * 1.60:
+                return "BALANCED"
+            return "BALANCED"
 
         if spread_bps >= self.max_spread_bps_for_market_open:
             return "PASSIVE"
@@ -439,9 +503,13 @@ class SmartOrderRouter:
         depth_ratio: float,
         spread_bps: float,
         quality_style: Optional[Dict[str, Any]] = None,
+        capital_mode: str = "UNKNOWN",
     ) -> int:
         split_count = self.default_split_count
         if action != "OPEN":
+            return 1
+
+        if capital_mode in ("SURVIVAL", "DEFENSIVE", "CAPITAL_PRESERVATION"):
             return 1
 
         if order_notional > 0:
@@ -457,7 +525,8 @@ class SmartOrderRouter:
         if quality_style and isinstance(quality_style, dict):
             split_count = max(split_count, self._safe_int(quality_style.get("split_count"), 1))
 
-        return max(1, min(self.max_split_count, split_count))
+        split_cap = self._capital_mode_split_cap(capital_mode)
+        return max(1, min(split_cap, split_count, self.max_split_count))
 
     def _select_order_type(
         self,
@@ -467,6 +536,7 @@ class SmartOrderRouter:
         est_slippage_bps: float,
         aggressiveness: str,
         quality_style: Optional[Dict[str, Any]] = None,
+        capital_mode: str = "UNKNOWN",
     ) -> str:
         try:
             if action in ("CLOSE", "PARTIAL_CLOSE"):
@@ -476,22 +546,31 @@ class SmartOrderRouter:
                 return "MARKET"
             if self.default_type == "LIMIT":
                 if volatility_value > self.market_order_volatility_threshold and spread_bps <= 3.5:
-                    return "MARKET"
+                    if capital_mode not in ("SURVIVAL", "DEFENSIVE", "CAPITAL_PRESERVATION"):
+                        return "MARKET"
                 return "LIMIT"
 
             allow_market = True
             if quality_style and isinstance(quality_style, dict):
                 allow_market = bool(quality_style.get("allow_market", True))
+            if capital_mode in ("SURVIVAL", "DEFENSIVE", "CAPITAL_PRESERVATION"):
+                allow_market = False if spread_bps > 3.0 else allow_market
             if not allow_market:
                 return "LIMIT"
-            if spread_bps >= self.max_spread_bps_for_market_open:
+
+            market_spread_cap = self._capital_mode_market_open_spread_cap(capital_mode)
+            market_slippage_cap = self._capital_mode_estimated_slippage_cap(capital_mode)
+
+            if spread_bps >= market_spread_cap:
                 return "LIMIT"
-            if est_slippage_bps >= self.max_estimated_slippage_bps:
+            if est_slippage_bps >= market_slippage_cap:
                 return "LIMIT"
             if aggressiveness == "AGGRESSIVE" and volatility_value >= self.market_order_volatility_threshold:
-                return "MARKET"
-            if volatility_value > self.market_order_volatility_threshold and spread_bps <= 4.0:
-                return "MARKET"
+                if capital_mode not in ("SURVIVAL", "DEFENSIVE", "CAPITAL_PRESERVATION"):
+                    return "MARKET"
+            if volatility_value > self.market_order_volatility_threshold and spread_bps <= 4.5:
+                if capital_mode not in ("SURVIVAL", "DEFENSIVE", "CAPITAL_PRESERVATION"):
+                    return "MARKET"
             return "LIMIT"
         except Exception as e:
             logging.error(f"Order type decision error: {e}")
@@ -636,6 +715,8 @@ class SmartOrderRouter:
             side = self._normalize_side(side)
             action = self._normalize_action(action)
             vol_value = self._extract_volatility_value(volatility)
+            extra_meta = extra_meta or {}
+            capital_mode = self._extract_capital_mode(extra_meta)
 
             if action == "OPEN" and side not in ("BUY", "SELL"):
                 raise ValueError(f"Invalid side for OPEN: {side}")
@@ -667,6 +748,7 @@ class SmartOrderRouter:
                 volatility_value=vol_value,
                 book_ctx=book_ctx,
                 quality_style=quality_style,
+                capital_mode=capital_mode,
             )
 
             est_slippage_market = self._estimate_slippage_bps(
@@ -689,6 +771,7 @@ class SmartOrderRouter:
                 est_slippage_bps=min(est_slippage_market, est_slippage_limit),
                 aggressiveness=aggressiveness,
                 quality_style=quality_style,
+                capital_mode=capital_mode,
             )
 
             split_count = self._decide_split_count(
@@ -698,11 +781,16 @@ class SmartOrderRouter:
                 depth_ratio=depth_ratio,
                 spread_bps=spread_bps,
                 quality_style=quality_style,
+                capital_mode=capital_mode,
             )
 
             final_urgency = self._normalize_urgency(urgency)
             if final_urgency == "NORMAL" and quality_style and isinstance(quality_style, dict):
                 final_urgency = self._normalize_urgency(quality_style.get("urgency"))
+
+            if capital_mode in ("SURVIVAL", "DEFENSIVE", "CAPITAL_PRESERVATION") and action == "OPEN":
+                if final_urgency == "URGENT":
+                    final_urgency = "HIGH"
 
             if order_type == "LIMIT" and ref_price <= 0:
                 logging.warning(f"LIMIT requested but price missing -> fallback MARKET | symbol={symbol} side={side}")
@@ -729,10 +817,11 @@ class SmartOrderRouter:
                 "book_pressure": book_pressure,
                 "top_book_ratio": top_ratio,
                 "depth_ratio": depth_ratio,
+                "capital_mode": capital_mode,
                 "router_meta": {
                     "quality_style": quality_style,
                     "market_context": book_ctx,
-                    "extra_meta": extra_meta or {},
+                    "extra_meta": extra_meta,
                 },
             }
 
@@ -767,7 +856,12 @@ class SmartOrderRouter:
             if order is None:
                 return []
 
+            capital_mode = str(order.get("capital_mode", "UNKNOWN")).upper().strip()
+            split_cap = self._capital_mode_split_cap(capital_mode)
+
             split_count = max(1, self._safe_int(order.get("split_count"), 1))
+            split_count = min(split_count, split_cap)
+
             if split_count <= 1:
                 return [order]
 
@@ -832,6 +926,8 @@ class SmartOrderRouter:
             normalized_side = self._normalize_side(side)
             normalized_action = self._normalize_action(action)
             vol_value = self._extract_volatility_value(volatility)
+            extra_meta = extra_meta or {}
+            capital_mode = self._extract_capital_mode(extra_meta)
 
             with self.lock:
                 if normalized_action == "OPEN":
@@ -882,26 +978,35 @@ class SmartOrderRouter:
                 spread_bps = self._safe_float(order.get("spread_bps"), 0.0)
                 est_market_slip = self._safe_float(order.get("estimated_market_slippage_bps"), 0.0)
 
-                if spread_bps > self.hard_block_spread_bps_for_open:
-                    if registered_duplicate_guard:
-                        self._rollback_routed_order(symbol, fingerprint)
-                    self.route_rejections += 1
-                    logging.warning(f"Order blocked by hard spread cap | symbol={symbol} spread_bps={spread_bps:.4f}")
-                    return None
+                hard_spread_cap = self._capital_mode_hard_spread_cap(capital_mode)
+                limit_spread_cap = self._capital_mode_limit_open_spread_cap(capital_mode)
+                market_slippage_cap = self._capital_mode_estimated_slippage_cap(capital_mode)
 
-                if spread_bps > self.max_spread_bps_for_limit_open:
-                    if registered_duplicate_guard:
-                        self._rollback_routed_order(symbol, fingerprint)
-                    self.route_rejections += 1
-                    logging.warning(f"Order blocked by excessive spread | symbol={symbol} spread_bps={spread_bps:.4f}")
-                    return None
-
-                if order.get("type") == "MARKET" and est_market_slip > self.max_estimated_slippage_bps * 1.2:
+                if spread_bps > hard_spread_cap:
                     if registered_duplicate_guard:
                         self._rollback_routed_order(symbol, fingerprint)
                     self.route_rejections += 1
                     logging.warning(
-                        f"Order blocked by excessive estimated slippage | symbol={symbol} est_market_slippage_bps={est_market_slip:.4f}"
+                        f"Order blocked by hard spread cap | symbol={symbol} spread_bps={spread_bps:.4f} capital_mode={capital_mode}"
+                    )
+                    return None
+
+                if spread_bps > limit_spread_cap:
+                    if registered_duplicate_guard:
+                        self._rollback_routed_order(symbol, fingerprint)
+                    self.route_rejections += 1
+                    logging.warning(
+                        f"Order blocked by excessive spread | symbol={symbol} spread_bps={spread_bps:.4f} capital_mode={capital_mode}"
+                    )
+                    return None
+
+                if order.get("type") == "MARKET" and est_market_slip > market_slippage_cap * 1.25:
+                    if registered_duplicate_guard:
+                        self._rollback_routed_order(symbol, fingerprint)
+                    self.route_rejections += 1
+                    logging.warning(
+                        f"Order blocked by excessive estimated slippage | symbol={symbol} "
+                        f"est_market_slippage_bps={est_market_slip:.4f} capital_mode={capital_mode}"
                     )
                     return None
 
@@ -913,13 +1018,14 @@ class SmartOrderRouter:
                     f"ORDER ROUTED | symbol={order['symbol']} action={order['action']} side={order['side']} "
                     f"qty={order['qty']} type={order['type']} price={order['price']} vol={order.get('volatility')} "
                     f"spread_bps={order.get('spread_bps')} split={order.get('split_count')} urgency={order.get('urgency')} "
-                    f"aggr={order.get('aggressiveness')}"
+                    f"aggr={order.get('aggressiveness')} capital_mode={order.get('capital_mode')}"
                 )
             else:
                 logging.info(
                     f"ORDER ROUTED | symbol={order['symbol']} action={order['action']} side={order['side']} "
                     f"qty={order['qty']} type={order['type']} vol={order.get('volatility')} spread_bps={order.get('spread_bps')} "
-                    f"split={order.get('split_count')} urgency={order.get('urgency')} aggr={order.get('aggressiveness')}"
+                    f"split={order.get('split_count')} urgency={order.get('urgency')} aggr={order.get('aggressiveness')} "
+                    f"capital_mode={order.get('capital_mode')}"
                 )
             return order
 
@@ -968,6 +1074,7 @@ class SmartOrderRouter:
                             "reason": order.get("reason"),
                             "urgency": order.get("urgency"),
                             "aggressiveness": order.get("aggressiveness"),
+                            "capital_mode": order.get("capital_mode"),
                         },
                     )
                 except Exception as mon_err:

@@ -14,7 +14,8 @@ class AlphaFusionEngine:
     5) 전략별 dict / str / None 반환을 모두 안전하게 처리
     6) 디버깅 가능한 상세 메타데이터 제공
     7) regime / execution quality / drawdown 환경까지 반영 가능한 구조
-    8) 기존 호출부 수정 최소화
+    8) capital mode 기반으로 초소액/방어/성장 모드별 진입 문턱 자동 조정
+    9) 기존 호출부 수정 최소화
     """
 
     def __init__(
@@ -23,13 +24,13 @@ class AlphaFusionEngine:
         pressure,
         velocity,
         volatility,
-        buy_threshold: float = 0.95,
-        sell_threshold: float = 0.95,
-        min_agree_count: int = 1,
-        signal_cooldown_seconds: float = 2.5,
-        same_side_rearm_seconds: float = 5.0,
-        flip_block_seconds: float = 8.0,
-        strong_flip_multiplier: float = 1.15,
+        buy_threshold: float = 0.58,
+        sell_threshold: float = 0.58,
+        min_agree_count: int = 2,
+        signal_cooldown_seconds: float = 9.0,
+        same_side_rearm_seconds: float = 2.8,
+        flip_block_seconds: float = 4.8,
+        strong_flip_multiplier: float = 1.12,
         use_volatility_filter: bool = True,
         min_volatility: float = 0.00035,
         max_volatility: float = 0.040,
@@ -40,8 +41,8 @@ class AlphaFusionEngine:
         self.velocity = velocity
         self.volatility = volatility
 
-        self.buy_threshold = float(buy_threshold)
-        self.sell_threshold = float(sell_threshold)
+        self.buy_threshold = float(abs(buy_threshold))
+        self.sell_threshold = float(abs(sell_threshold))
         self.min_agree_count = int(min_agree_count)
 
         self.signal_cooldown_seconds = float(signal_cooldown_seconds)
@@ -65,27 +66,23 @@ class AlphaFusionEngine:
         }
 
         self.regime_multipliers = {
-            "TREND_UP": {"BUY": 0.8, "SELL": 0.9},
-            "TREND_DOWN": {"BUY": 0.9, "SELL": 0.8},
-            "TREND": {"BUY": 0.85, "SELL": 0.85},
-            "MOMENTUM": {"BUY": 0.85, "SELL": 0.85},
-            "BALANCED": {"BUY": 1.1, "SELL": 1.1},
-            "NEUTRAL": {"BUY": 1.15, "SELL": 1.15},
-
-            "MEAN_REVERSION": {"BUY": 1.2, "SELL": 1.2},
-            "RANGE": {"BUY": 1.25, "SELL": 1.25},
-            "CHOPPY": {"BUY": 1.35, "SELL": 1.35},
-            "NOISE": {"BUY": 1.4, "SELL": 1.4},
-
-            "PANIC": {"BUY": 1.2, "SELL": 1.2},
-            "HIGH_VOL": {"BUY": 1.2, "SELL": 1.2},
-            "LOW_LIQUIDITY": {"BUY": 1.3, "SELL": 1.3},
-            "LIQUIDITY_CRISIS": {"BUY": 1.4, "SELL": 1.4},
-
-            "RISK_OFF": {"BUY": 1.5, "SELL": 1.5},
-            "DEFENSIVE": {"BUY": 1.3, "SELL": 1.3},
-
-            "UNKNOWN": {"BUY": 1.0, "SELL": 1.0},
+            "TREND_UP": {"BUY": 1.06, "SELL": 0.94},
+            "TREND_DOWN": {"BUY": 0.94, "SELL": 1.06},
+            "TREND": {"BUY": 1.02, "SELL": 1.02},
+            "MOMENTUM": {"BUY": 1.03, "SELL": 1.03},
+            "BALANCED": {"BUY": 1.00, "SELL": 1.00},
+            "NEUTRAL": {"BUY": 1.00, "SELL": 1.00},
+            "MEAN_REVERSION": {"BUY": 0.98, "SELL": 0.98},
+            "RANGE": {"BUY": 0.97, "SELL": 0.97},
+            "CHOPPY": {"BUY": 0.92, "SELL": 0.92},
+            "NOISE": {"BUY": 0.88, "SELL": 0.88},
+            "PANIC": {"BUY": 0.90, "SELL": 0.90},
+            "HIGH_VOL": {"BUY": 0.94, "SELL": 0.94},
+            "LOW_LIQUIDITY": {"BUY": 0.82, "SELL": 0.82},
+            "LIQUIDITY_CRISIS": {"BUY": 0.78, "SELL": 0.78},
+            "RISK_OFF": {"BUY": 0.90, "SELL": 0.90},
+            "DEFENSIVE": {"BUY": 0.92, "SELL": 0.92},
+            "UNKNOWN": {"BUY": 1.00, "SELL": 1.00},
         }
 
     def _log(self, msg: str) -> None:
@@ -225,17 +222,17 @@ class AlphaFusionEngine:
         if isinstance(execution_quality, dict):
             severity = str(execution_quality.get("severity", "")).upper().strip()
             if severity == "CRITICAL":
-                return 0.80
+                return 0.88
             if severity == "WARNING":
-                return 0.92
+                return 0.95
             if severity == "NORMAL":
                 return 1.0
 
             degradation_score = self._safe_float(execution_quality.get("degradation_score"), 0.0)
             if degradation_score >= 4:
-                return 0.80
+                return 0.88
             if degradation_score >= 2:
-                return 0.92
+                return 0.95
 
         return 1.0
 
@@ -246,12 +243,60 @@ class AlphaFusionEngine:
         if dd <= 0.01:
             return 1.00
         if dd <= 0.03:
-            return 0.96
+            return 0.97
         if dd <= 0.05:
-            return 0.90
+            return 0.93
         if dd <= 0.08:
-            return 0.82
-        return 0.74
+            return 0.88
+        return 0.82
+
+    def _extract_capital_mode(self, account_context: Optional[Dict[str, Any]]) -> str:
+        ctx = account_context or {}
+        return str(ctx.get("capital_mode", "UNKNOWN")).upper().strip()
+
+    def _capital_mode_threshold_multiplier(self, capital_mode: str) -> float:
+        mapping = {
+            "SURVIVAL": 1.00,
+            "MICRO_COMPOUND": 1.00,
+            "ADAPTIVE_GROWTH": 0.99,
+            "DEFENSIVE": 1.01,
+            "CAPITAL_PRESERVATION": 1.00,
+            "UNKNOWN": 1.00,
+        }
+        return mapping.get(capital_mode, 1.00)
+
+    def _capital_mode_quality_floor(self, capital_mode: str) -> float:
+        mapping = {
+            "SURVIVAL": 0.53,
+            "MICRO_COMPOUND": 0.52,
+            "ADAPTIVE_GROWTH": 0.50,
+            "DEFENSIVE": 0.55,
+            "CAPITAL_PRESERVATION": 0.54,
+            "UNKNOWN": 0.50,
+        }
+        return mapping.get(capital_mode, 0.50)
+
+    def _capital_mode_dominance_floor(self, capital_mode: str) -> float:
+        mapping = {
+            "SURVIVAL": 0.55,
+            "MICRO_COMPOUND": 0.55,
+            "ADAPTIVE_GROWTH": 0.54,
+            "DEFENSIVE": 0.56,
+            "CAPITAL_PRESERVATION": 0.56,
+            "UNKNOWN": 0.54,
+        }
+        return mapping.get(capital_mode, 0.54)
+
+    def _capital_mode_flip_multiplier(self, capital_mode: str) -> float:
+        mapping = {
+            "SURVIVAL": 1.03,
+            "MICRO_COMPOUND": 1.02,
+            "ADAPTIVE_GROWTH": 0.98,
+            "DEFENSIVE": 1.04,
+            "CAPITAL_PRESERVATION": 1.03,
+            "UNKNOWN": 1.00,
+        }
+        return mapping.get(capital_mode, 1.00)
 
     def _quality_adjusted_strength(self, sig: Dict[str, Any]) -> float:
         raw_strength = self._clamp_strength(sig["source"], float(sig.get("strength", 1.0)))
@@ -259,7 +304,14 @@ class AlphaFusionEngine:
         adjusted = raw_strength * (0.72 + 0.45 * quality)
         return float(adjusted)
 
-    def _blocked_by_timing(self, symbol: str, side: str, abs_score: float, dominant_quality: float) -> bool:
+    def _blocked_by_timing(
+        self,
+        symbol: str,
+        side: str,
+        abs_score: float,
+        dominant_quality: float,
+        capital_mode: str,
+    ) -> bool:
         now = time.time()
         last_ts = self.last_signal_ts.get(symbol)
         last_side = self.last_signal_side.get(symbol)
@@ -269,17 +321,28 @@ class AlphaFusionEngine:
 
         elapsed = now - last_ts
 
-        if elapsed < self.signal_cooldown_seconds:
+        signal_cooldown = self.signal_cooldown_seconds
+        same_side_rearm = self.same_side_rearm_seconds
+        flip_block = self.flip_block_seconds
+
+        if capital_mode in ("SURVIVAL", "DEFENSIVE", "CAPITAL_PRESERVATION"):
+            signal_cooldown *= 1.05
+            same_side_rearm *= 1.08
+            flip_block *= 1.08
+        elif capital_mode == "ADAPTIVE_GROWTH":
+            signal_cooldown *= 0.95
+            same_side_rearm *= 0.95
+
+        if elapsed < signal_cooldown:
             self._log(
-                f"[ALPHA BLOCK] {symbol} cooldown elapsed={elapsed:.3f} < {self.signal_cooldown_seconds:.3f}"
+                f"[ALPHA BLOCK] {symbol} cooldown elapsed={elapsed:.3f} < {signal_cooldown:.3f}"
             )
             return True
 
-        same_side_rearm = self.same_side_rearm_seconds
         if dominant_quality >= 0.82:
-            same_side_rearm *= 0.72
+            same_side_rearm *= 0.74
         elif dominant_quality >= 0.72:
-            same_side_rearm *= 0.85
+            same_side_rearm *= 0.86
 
         if side == last_side and elapsed < same_side_rearm:
             self._log(
@@ -287,13 +350,14 @@ class AlphaFusionEngine:
             )
             return True
 
-        if side != last_side and elapsed < self.flip_block_seconds:
+        if side != last_side and elapsed < flip_block:
             needed = max(self.buy_threshold, self.sell_threshold) * self.strong_flip_multiplier
+            needed *= self._capital_mode_flip_multiplier(capital_mode)
             if dominant_quality >= 0.88:
-                needed *= 0.96
+                needed *= 0.97
             if abs_score < needed:
                 self._log(
-                    f"[ALPHA BLOCK] {symbol} flip_block elapsed={elapsed:.3f} < {self.flip_block_seconds:.3f} "
+                    f"[ALPHA BLOCK] {symbol} flip_block elapsed={elapsed:.3f} < {flip_block:.3f} "
                     f"abs_score={abs_score:.4f} needed={needed:.4f}"
                 )
                 return True
@@ -331,6 +395,7 @@ class AlphaFusionEngine:
     ):
         try:
             trade = trade or {}
+            capital_mode = self._extract_capital_mode(account_context)
 
             qty = self._safe_float(trade.get("qty", 0.0), 0.0)
 
@@ -346,16 +411,18 @@ class AlphaFusionEngine:
             self._log(
                 f"[ALPHA DEBUG] {symbol} qty={qty} "
                 f"raw_micro={raw_micro} raw_pressure={raw_pressure} "
-                f"raw_velocity={raw_velocity} raw_volatility={raw_volatility}"
+                f"raw_velocity={raw_velocity} raw_volatility={raw_volatility} capital_mode={capital_mode}"
             )
 
             components = [s for s in (micro_sig, pressure_sig, velocity_sig) if s is not None]
             self._log(f"[ALPHA DEBUG] {symbol} components={components}")
 
-            if len(components) < self.min_agree_count:
+            dynamic_min_agree = self.min_agree_count
+
+            if len(components) < dynamic_min_agree:
                 self._log(
                     f"[ALPHA SKIP] {symbol} insufficient_components "
-                    f"count={len(components)} required={self.min_agree_count}"
+                    f"count={len(components)} required={dynamic_min_agree}"
                 )
                 return None
 
@@ -396,17 +463,24 @@ class AlphaFusionEngine:
                 if majority_quality_count > 0 else 0.6
             )
 
-            if weighted_score >= self.buy_threshold:
+            base_buy_threshold = self.buy_threshold
+            base_sell_threshold = self.sell_threshold
+            capital_mode_threshold_mult = self._capital_mode_threshold_multiplier(capital_mode)
+
+            dynamic_buy_threshold = base_buy_threshold * capital_mode_threshold_mult
+            dynamic_sell_threshold = base_sell_threshold * capital_mode_threshold_mult
+
+            if weighted_score >= dynamic_buy_threshold:
                 final_side = "BUY"
-                threshold = self.buy_threshold
-            elif weighted_score <= -self.sell_threshold:
+                threshold = dynamic_buy_threshold
+            elif weighted_score <= -dynamic_sell_threshold:
                 final_side = "SELL"
-                threshold = self.sell_threshold
+                threshold = dynamic_sell_threshold
             else:
                 self._log(
                     f"[ALPHA SKIP] {symbol} below_threshold "
                     f"weighted_score={weighted_score:.6f} "
-                    f"buy_threshold={self.buy_threshold:.6f} sell_threshold={self.sell_threshold:.6f}"
+                    f"buy_threshold={dynamic_buy_threshold:.6f} sell_threshold={dynamic_sell_threshold:.6f}"
                 )
                 return None
 
@@ -419,20 +493,21 @@ class AlphaFusionEngine:
             agree_count = buy_count if final_side == "BUY" else sell_count
             oppose_count = sell_count if final_side == "BUY" else buy_count
 
-            if agree_count < self.min_agree_count:
+            if agree_count < dynamic_min_agree:
                 self._log(
-                    f"[ALPHA SKIP] {symbol} weak_majority agree_count={agree_count} required={self.min_agree_count}"
+                    f"[ALPHA SKIP] {symbol} weak_majority agree_count={agree_count} required={dynamic_min_agree}"
                 )
                 return None
 
             if oppose_count > 0:
-                if abs_score < (threshold * 1.01):
+                mixed_needed = threshold * 1.01
+                if abs_score < mixed_needed:
                     self._log(
                         f"[ALPHA SKIP] {symbol} mixed_signal_weak_edge "
-                        f"abs_score={abs_score:.6f} needed={(threshold * 1.01):.6f}"
+                        f"abs_score={abs_score:.6f} needed={mixed_needed:.6f}"
                     )
                     return None
-                if dominant_quality < 0.54:
+                if dominant_quality < self._capital_mode_quality_floor(capital_mode):
                     self._log(
                         f"[ALPHA SKIP] {symbol} mixed_signal_low_quality quality={dominant_quality:.6f}"
                     )
@@ -442,33 +517,46 @@ class AlphaFusionEngine:
             volatility_filter_blocked = False
 
             if self.use_volatility_filter and vol_value is not None:
-                if vol_value < self.min_volatility or vol_value > self.max_volatility:
+                dynamic_min_vol = self.min_volatility
+                dynamic_max_vol = self.max_volatility
+
+                if capital_mode in ("SURVIVAL", "DEFENSIVE", "CAPITAL_PRESERVATION"):
+                    dynamic_max_vol *= 0.95
+                elif capital_mode == "ADAPTIVE_GROWTH":
+                    dynamic_max_vol *= 1.05
+
+                if vol_value < dynamic_min_vol or vol_value > dynamic_max_vol:
                     volatility_filter_blocked = True
                     self._log(
                         f"[ALPHA SKIP] {symbol} volatility_block "
-                        f"vol_value={vol_value:.8f} min={self.min_volatility:.8f} max={self.max_volatility:.8f}"
+                        f"vol_value={vol_value:.8f} min={dynamic_min_vol:.8f} max={dynamic_max_vol:.8f}"
                     )
                     return None
 
             total_count = max(1, buy_count + sell_count)
             dominance_ratio = agree_count / total_count
+            dominance_floor = self._capital_mode_dominance_floor(capital_mode)
 
-            if dominance_ratio < 0.55:
+            if dominance_ratio < dominance_floor:
                 self._log(
-                    f"[ALPHA SKIP] {symbol} low_dominance dominance_ratio={dominance_ratio:.6f}"
+                    f"[ALPHA SKIP] {symbol} low_dominance dominance_ratio={dominance_ratio:.6f} "
+                    f"required={dominance_floor:.6f}"
                 )
                 return None
 
-            if dominant_quality < 0.50:
+            quality_floor = self._capital_mode_quality_floor(capital_mode)
+            if dominant_quality < quality_floor:
                 self._log(
-                    f"[ALPHA SKIP] {symbol} low_quality dominant_quality={dominant_quality:.6f}"
+                    f"[ALPHA SKIP] {symbol} low_quality dominant_quality={dominant_quality:.6f} "
+                    f"required={quality_floor:.6f}"
                 )
                 return None
 
             edge_ratio = abs_score / max(threshold, 1e-9)
-            if edge_ratio < 1.0:
+            min_edge_ratio = 1.00
+            if edge_ratio < min_edge_ratio:
                 self._log(
-                    f"[ALPHA SKIP] {symbol} low_edge edge_ratio={edge_ratio:.6f}"
+                    f"[ALPHA SKIP] {symbol} low_edge edge_ratio={edge_ratio:.6f} required={min_edge_ratio:.6f}"
                 )
                 return None
 
@@ -479,14 +567,15 @@ class AlphaFusionEngine:
             adjusted_edge_ratio = edge_ratio * regime_multiplier * execution_penalty * drawdown_penalty
             adjusted_score = abs_score * regime_multiplier * execution_penalty * drawdown_penalty
 
-            if adjusted_edge_ratio < 0.92:
+            adjusted_edge_floor = 0.97
+            if adjusted_edge_ratio < adjusted_edge_floor:
                 self._log(
                     f"[ALPHA SKIP] {symbol} adjusted_edge_too_low "
-                    f"adjusted_edge_ratio={adjusted_edge_ratio:.6f}"
+                    f"adjusted_edge_ratio={adjusted_edge_ratio:.6f} required={adjusted_edge_floor:.6f}"
                 )
                 return None
 
-            if self._blocked_by_timing(symbol, final_side, adjusted_score, dominant_quality):
+            if self._blocked_by_timing(symbol, final_side, adjusted_score, dominant_quality, capital_mode):
                 return None
 
             now = time.time()
@@ -502,6 +591,7 @@ class AlphaFusionEngine:
                 "edge_ratio": round(edge_ratio, 6),
                 "adjusted_edge_ratio": round(adjusted_edge_ratio, 6),
                 "quality": round(float(dominant_quality), 6),
+                "confidence": round(float(dominant_quality), 6),
                 "agree_count": int(agree_count),
                 "oppose_count": int(oppose_count),
                 "buy_count": int(buy_count),
@@ -514,6 +604,13 @@ class AlphaFusionEngine:
                 "regime_multiplier": round(regime_multiplier, 6),
                 "execution_penalty": round(execution_penalty, 6),
                 "drawdown_penalty": round(drawdown_penalty, 6),
+                "capital_mode": capital_mode,
+                "capital_mode_threshold_mult": round(capital_mode_threshold_mult, 6),
+                "dynamic_buy_threshold": round(dynamic_buy_threshold, 6),
+                "dynamic_sell_threshold": round(dynamic_sell_threshold, 6),
+                "dynamic_min_agree": int(dynamic_min_agree),
+                "quality_floor": round(quality_floor, 6),
+                "dominance_floor": round(dominance_floor, 6),
                 "source": "alpha_fusion",
                 "ts": now,
             }
@@ -522,7 +619,7 @@ class AlphaFusionEngine:
                 f"[ALPHA FIRE] {symbol} side={final_side} score={adjusted_score:.6f} "
                 f"weighted_score={weighted_score:.6f} edge_ratio={edge_ratio:.6f} "
                 f"adjusted_edge_ratio={adjusted_edge_ratio:.6f} quality={dominant_quality:.6f} "
-                f"agree={agree_count} oppose={oppose_count}"
+                f"agree={agree_count} oppose={oppose_count} capital_mode={capital_mode}"
             )
 
             return result

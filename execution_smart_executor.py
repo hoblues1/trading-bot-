@@ -328,7 +328,7 @@ class SmartExecutor:
         return (fee_rate * 2.0) + max(0.0, slippage_ratio)
 
     def _extract_expected_edge_ratio(self, order: Dict[str, Any]) -> float:
-        for key in ("expected_edge_ratio", "edge_ratio", "alpha_edge_ratio"):
+        for key in ("expected_edge_ratio", "edge_ratio", "alpha_edge_ratio", "adjusted_edge_ratio"):
             val = self._safe_float(order.get(key), 0.0)
             if val > 0:
                 return val

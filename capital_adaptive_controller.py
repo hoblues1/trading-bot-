@@ -22,19 +22,27 @@ class CapitalAdaptiveController:
     """
     계좌 규모 / 최근 성과 / 드로우다운 / 장 상태를 바탕으로
     시스템 전체 운영 모드를 자동 조정하는 감독관.
+
+    설계 원칙
+    1) 초소액 구간에서는 공격보다 생존 우선
+    2) 200 USDT 전후를 첫 번째 승격 구간으로 설정
+    3) 손실 연속 / 드로우다운 / 극단 변동성에서는 자동 방어 전환
+    4) 계좌가 커질수록 분산과 안정성 비중 증가
+    5) capital_mode는 risk/sizing 전용
+    6) alpha_threshold / agree / cooldown 값은 반환은 유지하되 main에서 전략 덮어쓰기 금지
     """
 
     def __init__(
         self,
-        small_capital_threshold: float = 80.0,
-        medium_capital_threshold: float = 300.0,
-        large_capital_threshold: float = 1500.0,
+        micro_capital_threshold: float = 200.0,
+        small_capital_threshold: float = 1000.0,
+        medium_capital_threshold: float = 10000.0,
         max_defensive_drawdown_pct: float = 0.07,
         loss_streak_defensive_trigger: int = 4,
     ) -> None:
+        self.micro_capital_threshold = float(micro_capital_threshold)
         self.small_capital_threshold = float(small_capital_threshold)
         self.medium_capital_threshold = float(medium_capital_threshold)
-        self.large_capital_threshold = float(large_capital_threshold)
         self.max_defensive_drawdown_pct = float(max_defensive_drawdown_pct)
         self.loss_streak_defensive_trigger = int(loss_streak_defensive_trigger)
 
@@ -59,6 +67,7 @@ class CapitalAdaptiveController:
         base_mode = self._determine_base_mode(capital)
         final_mode = self._refine_mode(
             base_mode=base_mode,
+            capital=capital,
             recent_win_rate=recent_win_rate,
             recent_pnl_pct=recent_pnl_pct,
             current_drawdown_pct=current_drawdown_pct,
@@ -66,7 +75,7 @@ class CapitalAdaptiveController:
             regime=regime,
             volatility_state=volatility_state,
         )
-        config = self._build_mode_config(final_mode)
+        config = self._build_mode_config(final_mode, capital=capital)
 
         result = asdict(config)
         result.update(
@@ -84,17 +93,18 @@ class CapitalAdaptiveController:
         return result
 
     def _determine_base_mode(self, capital: float) -> str:
+        if capital < self.micro_capital_threshold:
+            return "SURVIVAL"
         if capital < self.small_capital_threshold:
-            return "GROWTH_AGGRESSIVE"
+            return "MICRO_COMPOUND"
         if capital < self.medium_capital_threshold:
-            return "BALANCED_GROWTH"
-        if capital < self.large_capital_threshold:
-            return "BALANCED"
+            return "ADAPTIVE_GROWTH"
         return "CAPITAL_PRESERVATION"
 
     def _refine_mode(
         self,
         base_mode: str,
+        capital: float,
         recent_win_rate: float,
         recent_pnl_pct: float,
         current_drawdown_pct: float,
@@ -111,61 +121,65 @@ class CapitalAdaptiveController:
         if volatility_state in {"EXTREME", "PANIC"}:
             return "DEFENSIVE"
 
-        if base_mode == "GROWTH_AGGRESSIVE":
-            if regime in {"RANGE", "LOW_VOL"} and recent_win_rate < 0.45:
-                return "BALANCED_GROWTH"
-            return "GROWTH_AGGRESSIVE"
+        if base_mode == "SURVIVAL":
+            if regime in {"RANGE", "LOW_VOL", "CHOPPY"} and recent_win_rate < 0.50:
+                return "SURVIVAL"
+            if recent_win_rate >= 0.58 and recent_pnl_pct > 0.02:
+                return "MICRO_COMPOUND"
+            return "SURVIVAL"
 
-        if base_mode == "BALANCED_GROWTH":
-            if recent_win_rate < 0.42 and recent_pnl_pct < 0:
-                return "BALANCED"
-            return "BALANCED_GROWTH"
+        if base_mode == "MICRO_COMPOUND":
+            if recent_win_rate < 0.44 and recent_pnl_pct < 0:
+                return "SURVIVAL"
+            if recent_win_rate >= 0.56 and recent_pnl_pct > 0.03 and regime in {"TREND_UP", "TREND_DOWN", "TREND"}:
+                return "ADAPTIVE_GROWTH"
+            return "MICRO_COMPOUND"
 
-        if base_mode == "BALANCED":
-            if recent_win_rate < 0.40 and recent_pnl_pct < 0:
-                return "DEFENSIVE"
-            return "BALANCED"
+        if base_mode == "ADAPTIVE_GROWTH":
+            if recent_win_rate < 0.43 and recent_pnl_pct < 0:
+                return "MICRO_COMPOUND"
+            return "ADAPTIVE_GROWTH"
 
         return "CAPITAL_PRESERVATION"
 
-    def _build_mode_config(self, mode: str) -> CapitalModeConfig:
-        if mode == "GROWTH_AGGRESSIVE":
+    def _build_mode_config(self, mode: str, capital: float) -> CapitalModeConfig:
+        if mode == "SURVIVAL":
             return CapitalModeConfig(
                 mode=mode,
-                leverage_cap=10,
-                max_positions=3,
-                risk_per_trade=0.025,
-                alpha_threshold=0.68,
+                leverage_cap=6,
+                max_positions=1,
+                risk_per_trade=0.0105,
+                alpha_threshold=0.58,
                 min_agree_count=2,
-                cooldown_seconds=8,
-                allow_aggressive_entries=True,
-                partial_take_profit_enabled=True,
-                break_even_enabled=True,
-            )
-
-        if mode == "BALANCED_GROWTH":
-            return CapitalModeConfig(
-                mode=mode,
-                leverage_cap=8,
-                max_positions=3,
-                risk_per_trade=0.018,
-                alpha_threshold=0.72,
-                min_agree_count=2,
-                cooldown_seconds=12,
+                cooldown_seconds=9,
                 allow_aggressive_entries=False,
                 partial_take_profit_enabled=True,
                 break_even_enabled=True,
             )
 
-        if mode == "BALANCED":
+        if mode == "MICRO_COMPOUND":
             return CapitalModeConfig(
                 mode=mode,
-                leverage_cap=6,
-                max_positions=4,
-                risk_per_trade=0.012,
-                alpha_threshold=0.77,
-                min_agree_count=3,
-                cooldown_seconds=18,
+                leverage_cap=7,
+                max_positions=1,
+                risk_per_trade=0.0125,
+                alpha_threshold=0.58,
+                min_agree_count=2,
+                cooldown_seconds=9,
+                allow_aggressive_entries=False,
+                partial_take_profit_enabled=True,
+                break_even_enabled=True,
+            )
+
+        if mode == "ADAPTIVE_GROWTH":
+            return CapitalModeConfig(
+                mode=mode,
+                leverage_cap=8,
+                max_positions=2,
+                risk_per_trade=0.0140,
+                alpha_threshold=0.58,
+                min_agree_count=2,
+                cooldown_seconds=9,
                 allow_aggressive_entries=False,
                 partial_take_profit_enabled=True,
                 break_even_enabled=True,
@@ -175,11 +189,11 @@ class CapitalAdaptiveController:
             return CapitalModeConfig(
                 mode=mode,
                 leverage_cap=4,
-                max_positions=2,
-                risk_per_trade=0.007,
-                alpha_threshold=0.82,
-                min_agree_count=3,
-                cooldown_seconds=20,
+                max_positions=1,
+                risk_per_trade=0.0060,
+                alpha_threshold=0.58,
+                min_agree_count=2,
+                cooldown_seconds=9,
                 allow_aggressive_entries=False,
                 partial_take_profit_enabled=True,
                 break_even_enabled=True,
@@ -187,12 +201,12 @@ class CapitalAdaptiveController:
 
         return CapitalModeConfig(
             mode="CAPITAL_PRESERVATION",
-            leverage_cap=3,
-            max_positions=3,
-            risk_per_trade=0.005,
-            alpha_threshold=0.84,
-            min_agree_count=3,
-            cooldown_seconds=22,
+            leverage_cap=5,
+            max_positions=2,
+            risk_per_trade=0.0075,
+            alpha_threshold=0.58,
+            min_agree_count=2,
+            cooldown_seconds=9,
             allow_aggressive_entries=False,
             partial_take_profit_enabled=True,
             break_even_enabled=True,

@@ -12,6 +12,7 @@ from config import (
     API_KEY,
     API_SECRET,
     LEVERAGE,
+    MAX_DAILY_TRADES,
     MICRO_WINDOW_SECONDS,
     MICRO_IMBALANCE_THRESHOLD,
     MICRO_MIN_TOTAL_FLOW,
@@ -125,16 +126,19 @@ class TradingSystem:
     Institutional / hedge-fund style main orchestration layer
 
     핵심 보강:
-    1) NEW / ACCEPTED 를 체결 성공과 분리
-    2) 진입 실패 후 즉시 재진입 반복 방지
-    3) 막 청산된 심볼 즉시 재진입 완화
-    4) 신호 품질 점수화 후 저질 진입 차단
-    5) regime / signal consensus / execution quality를 sizing에 더 깊게 반영
-    6) post execution reconcile 시 실제 fill 정보 우선 사용
-    7) kill / spread / stale market / duplicate entry 방어 강화
-    8) orchestration log / runtime snapshot 강화
-    9) paper/live 공용 유지
-    10) 장기 운용형 안정 구조 유지
+    1) CapitalAdaptiveController 결과를 실전 엔진에 실제 반영
+    2) 초소액에서는 max_positions=1 / risk_per_trade 축소 자동 적용
+    3) NEW / ACCEPTED 를 체결 성공과 분리
+    4) 진입 실패 후 즉시 재진입 반복 방지
+    5) 막 청산된 심볼 즉시 재진입 완화
+    6) 신호 품질 점수화 후 저질 진입 차단
+    7) regime / signal consensus / execution quality를 sizing에 더 깊게 반영
+    8) post execution reconcile 시 실제 fill 정보 우선 사용
+    9) kill / spread / stale market / duplicate entry 방어 강화
+    10) paper/live 공용 유지
+    11) capital_mode는 risk/sizing 레이어 중심으로 반영하고,
+        alpha 엔진 자체를 과도하게 덮어써서 거래가 죽지 않도록 유지
+    12) 일일 거래 횟수 제한(MAX_DAILY_TRADES) 적용
     """
 
     FINAL_SUCCESS_STATUSES = {"FILLED", "PARTIALLY_FILLED", "SUCCESS", "EXECUTED"}
@@ -158,7 +162,10 @@ class TradingSystem:
         self.last_failed_entry_ts: Dict[str, float] = {}
         self.last_flatten_ts: Dict[str, float] = {}
         self.last_exec_ok_ts: Dict[str, float] = {}
+        self.last_regime_by_symbol: Dict[str, Any] = {}
+        self.last_volatility_by_symbol: Dict[str, float] = {}
         self.loop_iterations = 0
+
         self.min_signal_interval_seconds = MIN_SIGNAL_INTERVAL_SECONDS
         self.max_market_staleness_seconds = 5.0
         self.position_manage_interval_seconds = 0.35
@@ -167,10 +174,8 @@ class TradingSystem:
         self.post_close_reentry_cooldown_seconds = 1.6
         self.last_balance_refresh_ts = 0.0
 
-        # 최신 체결 저장소 (velocity / debug / fallback 용)
         self.latest_trade_by_symbol: Dict[str, Dict[str, Any]] = {}
 
-        # trade loop runtime
         self.loop_sleep_seconds = 2.0
         self.last_trade_loop_log_ts: Dict[str, float] = {}
         self.trade_loop_log_interval = 5.0
@@ -178,10 +183,13 @@ class TradingSystem:
         self.tasks: Dict[str, asyncio.Task] = {}
         self.shutdown_requested = False
 
+        self.current_trade_day_key = time.strftime("%Y-%m-%d")
+        self.daily_trade_count = 0
+        self.max_daily_trades = int(MAX_DAILY_TRADES)
+
         self.client = Client(API_KEY, API_SECRET)
         boot_log("Binance Client initialized")
 
-        # ===== Futures 잔고 =====
         self.balance = self._fetch_initial_balance()
         logging.info(f"Initial Balance (Futures USDT): {self.balance}")
 
@@ -210,11 +218,6 @@ class TradingSystem:
             max_stored_trades_per_symbol=MICRO_MAX_STORED_TRADES,
         )
         engine_log("micro", self.micro)
-        logging.info(
-            f"[TUNE] MICRO | window={MICRO_WINDOW_SECONDS} | "
-            f"flow={MICRO_MIN_TOTAL_FLOW} | trades={MICRO_MIN_TRADE_COUNT} | "
-            f"net_ratio={MICRO_MIN_NET_FLOW_RATIO}"
-        )
 
         self.pressure = OrderflowPressureEngine(
             window_seconds=PRESSURE_WINDOW_SECONDS,
@@ -244,8 +247,8 @@ class TradingSystem:
             self.pressure,
             self.velocity,
             self.volatility,
-            buy_threshold=ALPHA_BUY_THRESHOLD,
-            sell_threshold=ALPHA_SELL_THRESHOLD,
+            buy_threshold=abs(ALPHA_BUY_THRESHOLD),
+            sell_threshold=abs(ALPHA_SELL_THRESHOLD),
             min_agree_count=ALPHA_MIN_AGREE_COUNT,
             signal_cooldown_seconds=ALPHA_SIGNAL_COOLDOWN_SECONDS,
             same_side_rearm_seconds=ALPHA_SAME_SIDE_REARM_SECONDS,
@@ -256,10 +259,6 @@ class TradingSystem:
             max_volatility=999999.0,
         )
         engine_log("alpha", self.alpha)
-        logging.info(
-            f"[TUNE] ALPHA | buy={ALPHA_BUY_THRESHOLD} | "
-            f"sell={ALPHA_SELL_THRESHOLD} | agree={ALPHA_MIN_AGREE_COUNT}"
-        )
 
         self.filter = TradeFilterEngine()
         engine_log("filter", self.filter)
@@ -280,7 +279,6 @@ class TradingSystem:
 
         try:
             self.pnl.set_balance(self.balance)
-            boot_log(f"PnL balance synced | balance={self.balance}")
         except Exception:
             pass
 
@@ -306,10 +304,6 @@ class TradingSystem:
             min_qty=EXECUTOR_MIN_QTY,
         )
         engine_log("executor", self.executor)
-        logging.info(
-            f"[TUNE] EXECUTOR | min_interval={EXECUTOR_MIN_ORDER_INTERVAL_SECONDS} | "
-            f"lock={EXECUTOR_SYMBOL_LOCK_SECONDS} | min_qty={EXECUTOR_MIN_QTY}"
-        )
 
         # CORE
         self.spread = SpreadFilter()
@@ -327,7 +321,6 @@ class TradingSystem:
         engine_log("trade_logger", self.trade_logger)
 
         # ===== ADVANCED CONTROL ENGINES =====
-
         self.capital_controller = CapitalAdaptiveController()
         engine_log("capital_controller", self.capital_controller)
 
@@ -358,6 +351,17 @@ class TradingSystem:
         self.signal_consensus = SignalConsensusGuard()
         engine_log("signal_consensus", self.signal_consensus)
 
+        # ===== RUNTIME CAPITAL MODE =====
+        self.runtime_mode: Dict[str, Any] = {}
+        self.runtime_max_positions: int = 1
+        self.runtime_risk_per_trade: float = 0.008
+        self.runtime_alpha_threshold: float = abs(ALPHA_BUY_THRESHOLD)
+        self.runtime_min_agree_count: int = ALPHA_MIN_AGREE_COUNT
+        self.runtime_cooldown_seconds: int = ALPHA_SIGNAL_COOLDOWN_SECONDS
+        self.runtime_leverage_cap: int = LEVERAGE
+
+        self._apply_capital_mode(force=True)
+
         boot_log("System Initialized")
 
     # ================= INTERNAL =================
@@ -379,6 +383,20 @@ class TradingSystem:
             return int(value)
         except Exception:
             return default
+
+    def _reset_daily_trade_counter_if_needed(self):
+        day_key = time.strftime("%Y-%m-%d")
+        if day_key != self.current_trade_day_key:
+            self.current_trade_day_key = day_key
+            self.daily_trade_count = 0
+
+    def _can_trade_today(self) -> bool:
+        self._reset_daily_trade_counter_if_needed()
+        return self.daily_trade_count < self.max_daily_trades
+
+    def _mark_trade_count(self, count: int = 1):
+        self._reset_daily_trade_counter_if_needed()
+        self.daily_trade_count += max(0, int(count))
 
     def _fetch_initial_balance(self) -> float:
         try:
@@ -423,6 +441,140 @@ class TradingSystem:
         except Exception as e:
             logging.error(f"Kill switch sync error: {e}")
 
+    def _apply_symbol_leverage_cap(self):
+        applied = min(int(LEVERAGE), int(self.runtime_leverage_cap))
+        for s in self.symbols:
+            try:
+                self.client.futures_change_leverage(symbol=s, leverage=applied)
+                logging.info(f"[CAPITAL_MODE] leverage applied | {s} | {applied}x")
+            except Exception as e:
+                logging.error(f"[CAPITAL_MODE] leverage set failed | {s} | {e}")
+
+    def _estimate_recent_win_rate(self) -> float:
+        try:
+            stats = self.pnl.stats()
+            wins = self._safe_float(stats.get("win_count", stats.get("wins", 0.0)), 0.0)
+            losses = self._safe_float(stats.get("loss_count", stats.get("losses", 0.0)), 0.0)
+            total = wins + losses
+            if total <= 0:
+                return 0.50
+            return wins / total
+        except Exception:
+            return 0.50
+
+    def _estimate_recent_pnl_pct(self) -> float:
+        try:
+            stats = self.pnl.stats()
+            balance = self._safe_float(stats.get("balance"), self.balance)
+            total_pnl = self._safe_float(stats.get("total_pnl", stats.get("realized_pnl", 0.0)), 0.0)
+            if balance <= 0:
+                return 0.0
+            return total_pnl / balance
+        except Exception:
+            return 0.0
+
+    def _estimate_loss_streak(self) -> int:
+        try:
+            if hasattr(self.kill, "loss_streak"):
+                return self._safe_int(getattr(self.kill, "loss_streak"), 0)
+            status = self.kill.status() if hasattr(self.kill, "status") else {}
+            return self._safe_int(status.get("loss_streak"), 0)
+        except Exception:
+            return 0
+
+    def _estimate_drawdown_pct(self) -> float:
+        try:
+            status = self.kill.status() if hasattr(self.kill, "status") else {}
+            return abs(self._safe_float(status.get("drawdown", status.get("drawdown_ratio", 0.0)), 0.0))
+        except Exception:
+            return 0.0
+
+    def _current_regime_for_controller(self) -> str:
+        try:
+            for _, value in self.last_regime_by_symbol.items():
+                if isinstance(value, dict):
+                    regime = value.get("regime") or value.get("state") or value.get("market_regime")
+                    if regime:
+                        return str(regime).upper().strip()
+                elif value is not None:
+                    return str(value).upper().strip()
+        except Exception:
+            pass
+        return "UNKNOWN"
+
+    def _current_volatility_state_for_controller(self) -> str:
+        vals = [v for v in self.last_volatility_by_symbol.values() if self._safe_float(v, 0.0) > 0]
+        if not vals:
+            return "NORMAL"
+
+        avg_vol = sum(vals) / max(len(vals), 1)
+        if avg_vol >= 0.025:
+            return "PANIC"
+        if avg_vol >= 0.015:
+            return "EXTREME"
+        if avg_vol <= 0.003:
+            return "LOW"
+        return "NORMAL"
+
+    def _apply_capital_mode(self, force: bool = False):
+        try:
+            recent_win_rate = self._estimate_recent_win_rate()
+            recent_pnl_pct = self._estimate_recent_pnl_pct()
+            current_drawdown_pct = self._estimate_drawdown_pct()
+            loss_streak = self._estimate_loss_streak()
+            regime = self._current_regime_for_controller()
+            volatility_state = self._current_volatility_state_for_controller()
+
+            mode = self.capital_controller.evaluate(
+                capital=self.balance,
+                recent_win_rate=recent_win_rate,
+                recent_pnl_pct=recent_pnl_pct,
+                current_drawdown_pct=current_drawdown_pct,
+                loss_streak=loss_streak,
+                regime=regime,
+                volatility_state=volatility_state,
+            )
+
+            changed = force or (mode.get("mode") != self.runtime_mode.get("mode"))
+
+            self.runtime_mode = mode
+            self.runtime_max_positions = self._safe_int(mode.get("max_positions"), 1)
+            self.runtime_risk_per_trade = self._safe_float(mode.get("risk_per_trade"), 0.008)
+            self.runtime_alpha_threshold = self._safe_float(mode.get("alpha_threshold"), abs(ALPHA_BUY_THRESHOLD))
+            self.runtime_min_agree_count = self._safe_int(mode.get("min_agree_count"), ALPHA_MIN_AGREE_COUNT)
+            self.runtime_cooldown_seconds = self._safe_int(mode.get("cooldown_seconds"), ALPHA_SIGNAL_COOLDOWN_SECONDS)
+            self.runtime_leverage_cap = self._safe_int(mode.get("leverage_cap"), LEVERAGE)
+
+            if hasattr(self.position, "max_positions"):
+                self.position.max_positions = self.runtime_max_positions
+
+            if hasattr(self.position, "risk_per_trade"):
+                self.position.risk_per_trade = self.runtime_risk_per_trade
+
+            if hasattr(self.sizing, "risk_per_trade"):
+                self.sizing.risk_per_trade = self.runtime_risk_per_trade
+
+            # 중요:
+            # alpha의 threshold / agree / cooldown을 capital_mode로 계속 덮어쓰면
+            # 실전에서 거래가 죽을 수 있으므로 여기서는 관측용/런타임 보관만 하고
+            # 실제 전략 파라미터는 기본 config 중심 유지한다.
+            # 즉 risk/sizing/positions/leverage 위주 반영.
+
+            if changed:
+                logging.warning(
+                    f"[CAPITAL_MODE] mode={mode.get('mode')} | base={mode.get('base_mode')} | "
+                    f"capital={self.balance:.4f} | max_positions={self.runtime_max_positions} | "
+                    f"risk_per_trade={self.runtime_risk_per_trade:.4f} | "
+                    f"alpha_threshold(observe)={self.runtime_alpha_threshold:.4f} | "
+                    f"agree(observe)={self.runtime_min_agree_count} | "
+                    f"cooldown(observe)={self.runtime_cooldown_seconds} | "
+                    f"lev_cap={self.runtime_leverage_cap}"
+                )
+                self._apply_symbol_leverage_cap()
+
+        except Exception as e:
+            logging.error(f"[CAPITAL_MODE] apply failed | {e}")
+
     def _normalize_signal(self, value: Any) -> int:
         if value is None:
             return 0
@@ -454,7 +606,7 @@ class TradingSystem:
 
     def _extract_result_ok(self, result: Any) -> bool:
         if isinstance(result, bool):
-            return not result
+            return result
         if isinstance(result, dict):
             status = self._extract_result_status(result)
             if status in self.FINAL_FAILURE_STATUSES:
@@ -472,6 +624,16 @@ class TradingSystem:
 
     def _extract_fill_qty(self, result: Any, fallback_qty: float = 0.0) -> float:
         if isinstance(result, dict):
+            if result.get("split") and isinstance(result.get("results"), list):
+                total = 0.0
+                for r in result.get("results", []):
+                    if isinstance(r, dict):
+                        total += self._safe_float(
+                            r.get("executedQty", r.get("executed_qty", r.get("filled_qty", 0.0))),
+                            0.0,
+                        )
+                if total > 0:
+                    return total
             return self._safe_float(
                 result.get("executedQty", result.get("executed_qty", result.get("filled_qty", fallback_qty))),
                 fallback_qty,
@@ -480,6 +642,24 @@ class TradingSystem:
 
     def _extract_fill_price(self, result: Any, fallback_price: float = 0.0) -> float:
         if isinstance(result, dict):
+            if result.get("split") and isinstance(result.get("results"), list):
+                weighted_notional = 0.0
+                weighted_qty = 0.0
+                for r in result.get("results", []):
+                    if isinstance(r, dict):
+                        qty = self._safe_float(
+                            r.get("executedQty", r.get("executed_qty", r.get("filled_qty", 0.0))),
+                            0.0,
+                        )
+                        px = self._safe_float(
+                            r.get("avgPrice", r.get("avg_price", r.get("price", 0.0))),
+                            0.0,
+                        )
+                        if qty > 0 and px > 0:
+                            weighted_notional += qty * px
+                            weighted_qty += qty
+                if weighted_qty > 0:
+                    return weighted_notional / weighted_qty
             return self._safe_float(
                 result.get("avgPrice", result.get("avg_price", result.get("price", fallback_price))),
                 fallback_price,
@@ -553,6 +733,7 @@ class TradingSystem:
         positive = 0
         negative = 0
         non_zero = 0
+
         for key, value in signals.items():
             v = self._safe_float(value, 0.0)
             if v > 0:
@@ -587,16 +768,21 @@ class TradingSystem:
         if isinstance(regime, bool):
             return regime
         if isinstance(regime, dict):
+            regime_label = str(regime.get("regime", regime.get("state", ""))).upper().strip()
+            if regime_label in {"WARMUP", "SHOCK", "LOW_LIQUIDITY"}:
+                return False
+
             for key in ("allow_trade", "allow", "allowed", "ok", "pass"):
                 if key in regime and regime[key] is False:
-                    return False
+                    if regime_label not in {"TREND_UP", "TREND_DOWN", "TREND", "RANGE"}:
+                        return False
 
             trend_bias = regime.get("trend_bias") or regime.get("bias") or regime.get("direction")
             if trend_bias is not None:
                 bias = self._normalize_signal(trend_bias)
                 if bias != 0 and alpha_signal != 0 and bias != alpha_signal:
                     strength = self._safe_float(regime.get("trend_strength", regime.get("strength", 0.0)), 0.0)
-                    if strength >= 0.6:
+                    if strength >= 0.65:
                         return False
         return True
 
@@ -620,24 +806,80 @@ class TradingSystem:
         if abs(weighted_score) < 1.0:
             logging.info(f"[ENTRY_BLOCK] {symbol} | weighted_score too weak={weighted_score:.4f}")
             return False
-        if confidence < 0.3:
+        if confidence < 0.28:
             logging.info(f"[ENTRY_BLOCK] {symbol} | confidence too weak={confidence:.4f}")
             return False
         if conflict >= 2 and confidence < 0.25:
             logging.info(f"[ENTRY_BLOCK] {symbol} | conflict too high={conflict} confidence={confidence:.4f}")
             return False
-
-      # if not self._regime_allows_entry(regime, alpha_signal):
-      #     logging.info(f"[ENTRY_BLOCK] {symbol} | regime veto")
-      #     return False
+        if not self._regime_allows_entry(regime, alpha_signal):
+            logging.info(f"[ENTRY_BLOCK] {symbol} | regime veto")
+            return False
 
         return True
+
+    def _has_open_position(self, symbol: str) -> bool:
+        for method_name in ("has_position", "has_open_position", "is_open", "exists"):
+            fn = getattr(self.position, method_name, None)
+            if callable(fn):
+                try:
+                    return bool(fn(symbol))
+                except TypeError:
+                    try:
+                        return bool(fn(symbol=symbol))
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+        for attr in ("positions", "open_positions", "position_map", "state"):
+            obj = getattr(self.position, attr, None)
+            if isinstance(obj, dict):
+                val = obj.get(symbol)
+                if val:
+                    return True
+        return False
+
+    def _throttle_signal(self, symbol: str) -> bool:
+        now = time.time()
+        last_ts = self.last_signal_ts.get(symbol, 0.0)
+        if now - last_ts < self.min_signal_interval_seconds:
+            return True
+        self.last_signal_ts[symbol] = now
+        return False
+
+    def _should_log_symbol(self, symbol: str) -> bool:
+        now = time.time()
+        last = self.last_trade_loop_log_ts.get(symbol, 0.0)
+        if now - last >= self.trade_loop_log_interval:
+            self.last_trade_loop_log_ts[symbol] = now
+            return True
+        return False
+
+    def _should_manage_position(self, symbol: str) -> bool:
+        now = time.time()
+        last = self.last_position_manage_ts.get(symbol, 0.0)
+        if now - last >= self.position_manage_interval_seconds:
+            self.last_position_manage_ts[symbol] = now
+            return True
+        return False
 
     def _can_attempt_new_entry(self, symbol: str) -> bool:
         now = time.time()
 
         if self._has_open_position(symbol):
             logging.warning(f"[BLOCK] already in position | {symbol}")
+            return False
+
+        try:
+            if hasattr(self.position, "position_count"):
+                if self.position.position_count() >= self.runtime_max_positions:
+                    return False
+        except Exception:
+            pass
+
+        if not self._can_trade_today():
+            logging.warning(f"[BLOCK] daily trade limit reached | current={self.daily_trade_count} max={self.max_daily_trades}")
             return False
 
         if now - self._safe_float(self.last_exec_ok_ts.get(symbol), 0.0) < 10:
@@ -651,7 +893,6 @@ class TradingSystem:
 
         return True
 
-  
     # ================= OPTIONAL CALLBACKS =================
     def on_trade(self, trade: Dict[str, Any]) -> None:
         try:
@@ -744,12 +985,17 @@ class TradingSystem:
             try:
                 self._refresh_balance_safe()
                 self._sync_kill_switch_from_pnl()
+                self._apply_capital_mode()
+                self._reset_daily_trade_counter_if_needed()
+
                 stats = self.pnl.stats()
                 kill_status = self.kill.status() if hasattr(self.kill, "status") else {}
                 logging.info(
                     f"BALANCE={stats['balance']} | REALIZED={stats['realized_pnl']} | "
                     f"UNREALIZED={stats['unrealized_pnl']} | OPEN={stats['open_positions']} | "
-                    f"POS_ENGINE={self.position.position_count()} | KILL={kill_status.get('triggered', False)}"
+                    f"POS_ENGINE={self.position.position_count()} | MODE={self.runtime_mode.get('mode')} | "
+                    f"TRADES_TODAY={self.daily_trade_count}/{self.max_daily_trades} | "
+                    f"KILL={kill_status.get('triggered', False)}"
                 )
             except Exception as e:
                 logging.error(f"Heartbeat error: {e}")
@@ -886,11 +1132,7 @@ class TradingSystem:
         price = self._safe_float(market.get("last_price"), 0.0)
         bid = self._safe_float(market.get("best_bid"), 0.0)
         ask = self._safe_float(market.get("best_ask"), 0.0)
-        if price > 0:
-            return True
-        if bid > 0 and ask > 0:
-            return True
-        return False
+        return price > 0 or (bid > 0 and ask > 0)
 
     def _market_is_fresh(self, symbol: str) -> bool:
         last_ready = self._safe_float(self.last_market_ready_ts.get(symbol), 0.0)
@@ -913,58 +1155,12 @@ class TradingSystem:
             "book_pressure": 0.0,
         }
 
-    # ================= POSITION / RISK HELPERS =================
-    def _has_open_position(self, symbol: str) -> bool:
-        for method_name in ("has_position", "has_open_position", "is_open", "exists"):
-            fn = getattr(self.position, method_name, None)
-            if callable(fn):
-                try:
-                    return bool(fn(symbol))
-                except TypeError:
-                    try:
-                        return bool(fn(symbol=symbol))
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-
-        for attr in ("positions", "open_positions", "position_map", "state"):
-            obj = getattr(self.position, attr, None)
-            if isinstance(obj, dict):
-                val = obj.get(symbol)
-                if val:
-                    return True
-        return False
-
-    def _throttle_signal(self, symbol: str) -> bool:
-        now = time.time()
-        last_ts = self.last_signal_ts.get(symbol, 0.0)
-        if now - last_ts < self.min_signal_interval_seconds:
-            return True
-        self.last_signal_ts[symbol] = now
-        return False
-
-    def _should_log_symbol(self, symbol: str) -> bool:
-        now = time.time()
-        last = self.last_trade_loop_log_ts.get(symbol, 0.0)
-        if now - last >= self.trade_loop_log_interval:
-            self.last_trade_loop_log_ts[symbol] = now
-            return True
-        return False
-
-    def _should_manage_position(self, symbol: str) -> bool:
-        now = time.time()
-        last = self.last_position_manage_ts.get(symbol, 0.0)
-        if now - last >= self.position_manage_interval_seconds:
-            self.last_position_manage_ts[symbol] = now
-            return True
-        return False
-
+    # ================= RISK / FILTER HELPERS =================
     async def _check_kill_switch(self, symbol: str, market: Dict[str, Any]) -> bool:
         self._sync_kill_switch_from_pnl()
 
         result = await self._try_engine_methods(
-            self.kill_switch,
+            self.kill,
             ("check", "allow", "is_safe", "validate"),
             symbol,
             market,
@@ -979,13 +1175,11 @@ class TradingSystem:
         if isinstance(result, dict):
             if "triggered" in result:
                 return not bool(result["triggered"])
-
             for key in ("allowed", "ok", "safe", "pass", "passed"):
                 if key in result:
                     return bool(result[key])
 
         return True
-
 
     async def _check_spread_filter(self, symbol: str, market: Dict[str, Any]) -> bool:
         result = await self._try_engine_methods(self.spread, ("check", "allow", "validate", "filter"), symbol, market)
@@ -1001,7 +1195,10 @@ class TradingSystem:
 
     async def _compute_regime(self, symbol: str, market: Dict[str, Any]) -> Any:
         px = self._safe_float(market.get("last_price") or market.get("price") or market.get("px"), 0.0)
-        return await self._call_maybe_async(self.regime.signal, symbol=symbol, price=px)
+        market_context = self._build_market_context(market)
+        regime = await self._call_maybe_async(self.regime.signal, symbol=symbol, price=px, market_context=market_context)
+        self.last_regime_by_symbol[symbol] = regime
+        return regime
 
     async def _compute_signal_bundle(self, symbol: str, market: Dict[str, Any]) -> Dict[str, int]:
         micro_res = None
@@ -1030,14 +1227,29 @@ class TradingSystem:
             logging.error(f"TradeVelocityEngine failed | {symbol} | {e}")
 
         try:
-            volatility_res = await self._try_engine_methods(self.volatility, ("generate_signal", "compute", "analyze", "signal"), symbol, market)
+            volatility_res = await self._try_engine_methods(
+                self.volatility, ("generate_signal", "compute", "analyze", "signal"), symbol, market
+            )
         except Exception as e:
             logging.error(f"VolatilityEngine failed | {symbol} | {e}")
 
         try:
-            imbalance_res = await self._try_engine_methods(self.imbalance, ("generate_signal", "compute", "analyze", "signal"), symbol, market)
+            imbalance_res = await self._try_engine_methods(
+                self.imbalance, ("generate_signal", "compute", "analyze", "signal"), symbol, market
+            )
         except Exception as e:
             logging.error(f"OrderbookImbalanceStrategy failed | {symbol} | {e}")
+
+        vol_value = 0.0
+        if isinstance(volatility_res, dict):
+            for key in ("value", "volatility", "range_ratio", "atr_ratio", "current_volatility"):
+                if key in volatility_res:
+                    vol_value = self._safe_float(volatility_res.get(key), 0.0)
+                    if vol_value > 0:
+                        break
+        elif isinstance(volatility_res, (int, float)):
+            vol_value = self._safe_float(volatility_res, 0.0)
+        self.last_volatility_by_symbol[symbol] = vol_value
 
         return {
             "micro": self._normalize_signal(micro_res),
@@ -1047,7 +1259,7 @@ class TradingSystem:
             "imbalance": self._normalize_signal(imbalance_res),
         }
 
-    async def _compute_alpha_signal(self, symbol: str, market: Dict[str, Any], signals: Dict[str, int], regime: Any) -> int:
+    async def _compute_alpha_signal(self, symbol: str, market: Dict[str, Any], signals: Dict[str, int], regime: Any) -> Any:
         last_trade = self.latest_trade_by_symbol.get(symbol, {})
         trade_payload = {
             "qty": self._safe_float(last_trade.get("qty"), 0.0),
@@ -1070,6 +1282,11 @@ class TradingSystem:
                 "volatility_signal": signals.get("volatility", 0),
                 "imbalance_signal": signals.get("imbalance", 0),
                 "trade": trade_payload,
+                "account_context": {
+                     "capital_mode": self.runtime_mode.get("mode"),
+                     "drawdown_ratio": self._estimate_drawdown_pct(),
+                },
+                "execution_quality": self._extract_execution_quality(symbol),
             },
         )
 
@@ -1080,51 +1297,14 @@ class TradingSystem:
                 logging.error(f"AlphaFusionEngine.signal failed | {symbol} | {e}")
                 alpha_res = None
 
-        alpha_sig = self._normalize_signal(alpha_res)
-        if alpha_sig == 0:
-            score = sum(list(signals.values()))
-            if score >= 2:
-                return 1
-            if score <= -2:
-                return -1
-        return alpha_sig
+        return alpha_res
 
-    async def _check_kill_switch(self, symbol: str, market: Dict[str, Any]) -> bool:
-        self._sync_kill_switch_from_pnl()
-        
-        kill_engine = getattr(self, "kill_switch", None) or getattr(self, "system_kill_switch", None)
-        if kill_engine is None:
-            return True
-
-        result = await self._try_engine_methods(
-            kill_engine,
-            ("check", "allow", "is_safe", "validate"),
-            symbol,
-            market,
-        )
-
-        if result is None:
-            return True
-
-    async def _check_trade_filter(self, symbol: str, market: Dict[str, Any], *args, signal=None, regime=None, **kwargs) -> bool:
-        trade_filter_engine = getattr(self, "trade_filter", None) or getattr(self, "filter_engine", None)
+    async def _check_trade_filter(self, symbol: str, market: Dict[str, Any], signal=None, regime=None) -> bool:
+        trade_filter_engine = self.filter
         if trade_filter_engine is None:
             return True
 
-        # 호출부에서 위치 인자로 regime / signal 넘겨도 흡수
-        if regime is None and len(args) >= 1:
-            regime = args[0]
-
-        if signal is None and len(args) >= 2:
-            signal = args[1]
-
-        if regime is None and hasattr(self, "last_regime_by_symbol"):
-            regime = self.last_regime_by_symbol.get(symbol)
-
-        volatility = None
-        if hasattr(self, "last_volatility_by_symbol"):
-            volatility = self.last_volatility_by_symbol.get(symbol)
-
+        volatility = self.last_volatility_by_symbol.get(symbol)
         price = 0.0
         if isinstance(market, dict):
             price = market.get("last_price") or market.get("price") or market.get("px") or 0.0
@@ -1132,52 +1312,32 @@ class TradingSystem:
         result = await self._try_engine_methods(
             trade_filter_engine,
             ("allow", "filter", "check", "validate"),
-            symbol=symbol,
-            signal=signal,
-            price=price,
-            trade=market,
-            regime=regime,
-            volatility=volatility,
+            symbol,
+            market,
+            extras={
+                "signal": signal,
+                "price": price,
+                "trade": market,
+                "regime": regime,
+                "volatility": volatility,
+            },
         )
 
         if result is None:
             return True
-  
         if isinstance(result, bool):
             return result
-
         if isinstance(result, dict):
             for key in ("allowed", "ok", "safe", "pass", "passed"):
                 if key in result:
                     return bool(result[key])
-
-        return True
-
-        if isinstance(result, bool):
-            return result
-
-        if isinstance(result, dict):
-            for key in ("allowed", "ok", "safe", "pass", "passed"):
-                if key in result:
-                    return bool(result[key])
-
-        return True
-
-        if isinstance(result, bool):
-            return result
-
-        if isinstance(result, dict):
-            if "triggered" in result:
-                return not bool(result["triggered"])
-
-            for key in ("allowed", "ok", "safe", "pass", "passed"):
-                if key in result:
-                    return bool(result[key])
-
         return True
 
     async def _extract_volatility_value(self, symbol: str, market: Dict[str, Any]) -> float:
-        vol_value = 0.0
+        vol_value = self._safe_float(self.last_volatility_by_symbol.get(symbol), 0.0)
+        if vol_value > 0:
+            return vol_value
+
         try:
             vol_raw = await self._try_engine_methods(self.volatility, ("generate_signal", "compute", "analyze", "signal"), symbol, market)
             if isinstance(vol_raw, dict):
@@ -1190,6 +1350,8 @@ class TradingSystem:
                 vol_value = self._safe_float(vol_raw, 0.0)
         except Exception:
             pass
+
+        self.last_volatility_by_symbol[symbol] = vol_value
         return vol_value
 
     async def _compute_order_qty(
@@ -1223,6 +1385,9 @@ class TradingSystem:
             "drawdown_ratio": drawdown_ratio,
             "recent_exec_ok_ts": self.last_exec_ok_ts.get(symbol),
             "recent_exec_fail_ts": self.last_failed_entry_ts.get(symbol),
+            "capital_mode": self.runtime_mode.get("mode"),
+            "risk_per_trade": self.runtime_risk_per_trade,
+            "leverage_cap": self.runtime_leverage_cap,
         }
 
         regime_context = regime if isinstance(regime, dict) else {"value": regime}
@@ -1261,15 +1426,15 @@ class TradingSystem:
         qty: float,
         bundle_score: Dict[str, Any],
         regime: Any,
+        alpha_meta: Optional[Dict[str, Any]] = None,
     ) -> Any:
-
         now = time.time()
         last_exec = self.last_exec_ok_ts.get(symbol, 0)
 
         if now - last_exec < 10:
             logging.warning(f"[BLOCK] execution cooldown | {symbol}")
+            return {"ok": False, "reason": "execution_cooldown", "status": "FAILED"}
 
-            return {"ok": False, "reason": "execution_cooldown"}
         side = "BUY" if alpha_signal > 0 else "SELL"
 
         price = self._safe_float(market.get("last_price"), 0.0)
@@ -1278,6 +1443,8 @@ class TradingSystem:
 
         vol_value = await self._extract_volatility_value(symbol, market)
         market_context = self._build_market_context(market)
+
+        alpha_meta = alpha_meta or {}
 
         order = self.router.route(
             symbol=symbol,
@@ -1295,14 +1462,13 @@ class TradingSystem:
                 "signal_weighted_score": self._safe_float(bundle_score.get("weighted_score"), 0.0),
                 "signal_consensus_count": self._safe_int(bundle_score.get("consensus_count"), 0),
                 "regime": regime,
+                "capital_mode": self.runtime_mode.get("mode"),
                 "loop_ts": time.time(),
             },
         )
 
         if order is None:
-            logging.warning(
-                f"[EXEC_BLOCKED] {symbol} | side={side} | qty={qty} | price={price} | vol={vol_value} | reason=router_blocked"
-            )
+            logging.warning(f"[EXEC_BLOCKED] {symbol} | side={side} | qty={qty} | reason=router_blocked")
             return {"ok": False, "reason": "router_blocked", "status": "FAILED"}
 
         if price > 0:
@@ -1310,6 +1476,13 @@ class TradingSystem:
             order["last_price"] = price
             if "price" not in order:
                 order["price"] = price
+
+        # alpha 메타를 executor 기대값 체크용으로 주문 payload에 직접 반영
+        order["confidence"] = self._safe_float(alpha_meta.get("confidence", bundle_score.get("confidence", 0.0)), 0.0)
+        order["quality"] = self._safe_float(alpha_meta.get("quality", alpha_meta.get("confidence", bundle_score.get("confidence", 0.0))), 0.0)
+        order["score"] = self._safe_float(alpha_meta.get("score", abs(bundle_score.get("weighted_score", 0.0))), 0.0)
+        order["edge_ratio"] = self._safe_float(alpha_meta.get("adjusted_edge_ratio", alpha_meta.get("edge_ratio", 0.0)), 0.0)
+        order["adjusted_edge_ratio"] = self._safe_float(alpha_meta.get("adjusted_edge_ratio", 0.0), 0.0)
 
         if hasattr(self.slippage, "update_price") and price > 0:
             try:
@@ -1338,6 +1511,10 @@ class TradingSystem:
 
         if self._extract_result_ok(result):
             self.last_exec_ok_ts[symbol] = time.time()
+            success_count = 1
+            if isinstance(result, dict) and result.get("split"):
+                success_count = max(1, self._safe_int(result.get("success_count"), 1))
+            self._mark_trade_count(success_count)
         else:
             self.last_failed_entry_ts[symbol] = time.time()
 
@@ -1383,7 +1560,6 @@ class TradingSystem:
                     market_context=market_context,
                 )
                 if qty <= 0:
-                    self.position.cancel_pending_close(symbol)
                     return
 
                 order = self.router.route(
@@ -1397,9 +1573,9 @@ class TradingSystem:
                     reduce_only=True,
                     market_context=market_context,
                     urgency="HIGH",
+                    extra_meta={"capital_mode": self.runtime_mode.get("mode")},
                 )
                 if order is None:
-                    self.position.cancel_pending_close(symbol)
                     return
 
                 result = self.router.retry(order, self.executor.execute)
@@ -1415,8 +1591,6 @@ class TradingSystem:
                         self.kill.update_trade_result(pnl_value)
                     self.last_flatten_ts[symbol] = time.time()
                     logging.info(f"[POSITION_CLOSE_OK] {symbol} | fill_qty={fill_qty} | fill_price={fill_price}")
-                else:
-                    self.position.cancel_pending_close(symbol)
                 return
 
             if action.get("action") == "PARTIAL_CLOSE":
@@ -1432,7 +1606,6 @@ class TradingSystem:
                     market_context=market_context,
                 )
                 if qty <= 0:
-                    self.position.cancel_pending_partial(symbol)
                     return
 
                 order = self.router.route(
@@ -1446,20 +1619,19 @@ class TradingSystem:
                     reduce_only=True,
                     market_context=market_context,
                     urgency="HIGH",
+                    extra_meta={"capital_mode": self.runtime_mode.get("mode")},
                 )
                 if order is None:
-                    self.position.cancel_pending_partial(symbol)
                     return
 
                 result = self.router.retry(order, self.executor.execute)
                 if self._extract_result_ok(result):
                     fill_qty = self._extract_fill_qty(result, qty)
                     fill_price = self._extract_fill_price(result, price)
-                    self.position.apply_partial_close(symbol, fill_qty)
+                    if hasattr(self.position, "apply_partial_close"):
+                        self.position.apply_partial_close(symbol, fill_qty)
                     self.pnl.partial_close_position(symbol, fill_price, fill_qty, fee=0.0)
                     logging.info(f"[POSITION_PARTIAL_OK] {symbol} | fill_qty={fill_qty} | fill_price={fill_price}")
-                else:
-                    self.position.cancel_pending_partial(symbol)
         except Exception as e:
             logging.error(f"Position management error | {symbol} | {e}")
 
@@ -1484,13 +1656,12 @@ class TradingSystem:
                 return
 
             side = "BUY" if alpha_signal > 0 else "SELL"
+
             try:
-                self.position.mark_open_from_exchange(symbol, side, entry_price, fill_qty, overwrite=False)
-            except TypeError:
-                try:
-                    self.position.mark_open_from_exchange(symbol, side, entry_price, fill_qty)
-                except Exception:
-                    pass
+                if hasattr(self.position, "sync_from_exchange_position"):
+                    self.position.sync_from_exchange_position(symbol, side, entry_price, fill_qty)
+                elif hasattr(self.position, "open_position"):
+                    self.position.open_position(symbol, side, entry_price, fill_qty, source="exchange")
             except Exception:
                 pass
 
@@ -1525,11 +1696,12 @@ class TradingSystem:
                 self.loop_iterations += 1
                 self._refresh_balance_safe()
                 self._sync_kill_switch_from_pnl()
+                self._apply_capital_mode()
+                self._reset_daily_trade_counter_if_needed()
 
                 for symbol in self.symbols:
                     log_now = self._should_log_symbol(symbol)
 
-                    # STEP 1 - MARKET DATA
                     market = self._extract_ws_market(symbol)
                     if not self._market_is_ready(market):
                         if log_now:
@@ -1550,7 +1722,6 @@ class TradingSystem:
                         except Exception:
                             pass
 
-                    # 먼저 보유 포지션 관리
                     if self._has_open_position(symbol):
                         await self._manage_open_position(symbol, market)
                         if log_now:
@@ -1559,34 +1730,29 @@ class TradingSystem:
 
                     if not self._can_attempt_new_entry(symbol):
                         if log_now:
-                            logging.info(f"[TREE] {symbol} | BLOCKED | entry cooldown")
+                            logging.info(f"[TREE] {symbol} | BLOCKED | entry cooldown or max_positions or daily limit")
                         continue
 
                     if log_now:
                         logging.info(f"[TREE] {symbol} | DATA OK | px={market.get('last_price')}")
 
-                    # STEP 2 - KILL SWITCH
                     if not await self._check_kill_switch(symbol, market):
                         logging.warning(f"[TREE] {symbol} | BLOCKED | kill switch")
                         continue
 
-                    # STEP 3 - SPREAD FILTER
                     if not await self._check_spread_filter(symbol, market):
                         logging.warning(f"[TREE] {symbol} | BLOCKED | spread filter")
                         continue
 
-                    # STEP 4 - POSITION CHECK
                     if self._has_open_position(symbol):
                         if log_now:
                             logging.info(f"[TREE] {symbol} | SKIP | existing position")
                         continue
 
-                    # STEP 5 - REGIME
                     regime = await self._compute_regime(symbol, market)
                     if log_now:
                         logging.info(f"[TREE] {symbol} | REGIME | {regime}")
 
-                    # STEP 6 - SIGNALS
                     signals = await self._compute_signal_bundle(symbol, market)
                     bundle_score = self._score_signal_bundle(signals)
                     if log_now:
@@ -1596,46 +1762,55 @@ class TradingSystem:
                             f"| score={bundle_score['weighted_score']:.4f} confidence={bundle_score['confidence']:.4f}"
                         )
 
-                    # STEP 7 - ALPHA
-                    alpha_signal = await self._compute_alpha_signal(symbol, market, signals, regime)
+                    alpha_meta = await self._compute_alpha_signal(symbol, market, signals, regime)
+                    alpha_signal = self._normalize_signal(alpha_meta)
                     if log_now:
-                        logging.info(f"[TREE] {symbol} | ALPHA | {alpha_signal}")
+                        logging.info(f"[TREE] {symbol} | ALPHA | {alpha_meta}")
+
                     if alpha_signal == 0:
                         continue
 
-                    # STEP 7.5 - STRUCTURE CHECK
                     if not self._entry_quality_pass(symbol, alpha_signal, bundle_score, regime):
                         continue
 
-                    # STEP 8 - SIGNAL THROTTLE
                     if self._throttle_signal(symbol):
                         if log_now:
                             logging.info(f"[TREE] {symbol} | BLOCKED | signal throttle")
                         continue
 
-                    # STEP 9 - TRADE FILTER
-                    allowed = await self._check_trade_filter(symbol, market, alpha_signal, regime)
+                    filter_signal = alpha_meta if isinstance(alpha_meta, dict) else {
+                        "side": "BUY" if alpha_signal > 0 else "SELL",
+                        "signal": alpha_signal,
+                        "alpha": alpha_signal,
+                        "weighted_score": bundle_score.get("weighted_score", 0.0),
+                        "confidence": bundle_score.get("confidence", 0.0),
+                        "micro": signals.get("micro", 0),
+                        "pressure": signals.get("pressure", 0),
+                        "velocity": signals.get("velocity", 0),
+                        "imbalance": signals.get("imbalance", 0),
+                        "regime": regime,
+                        "source": "alpha_fallback",
+                    }
+
+                    allowed = await self._check_trade_filter(symbol, market, signal=filter_signal, regime=regime)
                     logging.info(f"[DBG 3 FILTER] {symbol} | allowed={allowed}")
                     if not allowed:
                         logging.warning(f"[TREE] {symbol} | BLOCKED | trade filter")
-                        logging.warning(f"[DBG 3-FAIL FILTER] {symbol} | allowed={allowed}")
                         continue
 
-                    # STEP 10 - ORDER SIZE
                     qty = await self._compute_order_qty(symbol, market, alpha_signal, regime, bundle_score)
                     logging.info(f"[DBG 4 SIZE_FINAL] {symbol} | qty={qty} | px={market.get('last_price')} | balance={self.balance}")
                     if qty <= 0:
                         logging.warning(f"[TREE] {symbol} | BLOCKED | invalid qty={qty}")
-                        logging.warning(f"[DBG 4-FAIL SIZE] {symbol} | qty={qty}")
                         continue
                     if log_now:
                         logging.info(f"[TREE] {symbol} | SIZE | qty={qty}")
 
-                    # STEP 11 - EXECUTION
                     logging.info(
-                        f"[DBG 5 EXECUTE] {symbol} | side={'BUY' if alpha_signal > 0 else 'SELL'} | qty={qty} | px={market.get('last_price')}"
+                        f"[DBG 5 EXECUTE] {symbol} | side={'BUY' if alpha_signal > 0 else 'SELL'} | "
+                        f"qty={qty} | px={market.get('last_price')}"
                     )
-                    exec_res = await self._execute_order(symbol, market, alpha_signal, qty, bundle_score, regime)
+                    exec_res = await self._execute_order(symbol, market, alpha_signal, qty, bundle_score, regime, alpha_meta=alpha_meta if isinstance(alpha_meta, dict) else None)
                     self._post_execution_reconcile(symbol, alpha_signal, market, qty, exec_res)
 
                     logging.info(f"[DBG 6 EXEC_RESULT] {symbol} | exec_res={exec_res}")
@@ -1654,6 +1829,7 @@ class TradingSystem:
         return {
             "symbols": list(self.symbols),
             "balance": self.balance,
+            "capital_mode": dict(self.runtime_mode),
             "uptime_seconds": max(0.0, time.time() - self.start_time),
             "loop_iterations": self.loop_iterations,
             "latest_trade_symbols": list(self.latest_trade_by_symbol.keys()),
@@ -1662,6 +1838,8 @@ class TradingSystem:
             "last_order_result_by_symbol": dict(self.last_order_result_by_symbol),
             "last_failed_entry_ts": dict(self.last_failed_entry_ts),
             "last_flatten_ts": dict(self.last_flatten_ts),
+            "daily_trade_count": self.daily_trade_count,
+            "max_daily_trades": self.max_daily_trades,
             "shutdown_requested": self.shutdown_requested,
             "updated_at": self.updated_at,
         }
@@ -1683,12 +1861,7 @@ async def main():
     await system.startup_flatten_positions()
     boot_log("startup_flatten_positions() completed")
 
-    for s in SYMBOLS:
-        try:
-            system.client.futures_change_leverage(symbol=s, leverage=LEVERAGE)
-            logging.info(f"Leverage set | {s} | {LEVERAGE}x")
-        except Exception as e:
-            logging.error(f"Leverage set failed for {s}: {e}")
+    system._apply_capital_mode(force=True)
 
     boot_log("creating async tasks")
     system.tasks["ws"] = asyncio.create_task(system.ws.start())

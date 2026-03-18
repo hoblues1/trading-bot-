@@ -21,37 +21,27 @@ class DynamicSizing:
     """
     Institutional / hedge-fund grade dynamic sizing engine
 
-    설계 목표:
-    1) 신호 강도 / 변동성 / 레짐 / 드로우다운 / 체결품질 / confidence를 동시에 반영
-    2) account context 기반 equity / free balance / available balance / margin ratio 반영
-    3) OPEN / CLOSE / PARTIAL_CLOSE sizing 모두 지원
-    4) 심볼별 리스크 캡 / step / min_qty 반영
-    5) exchange min notional / free balance buffer / margin usage 방어
-    6) current position 기반 symbol capacity 계산
-    7) partial close 시 지나치게 작은 찌꺼기 수량 방지
-    8) long-term 운영용 debug metadata 제공
-    9) meta 응답과 raw size 응답 모두 지원
-    10) 잘못된 입력값이나 누락된 market context에도 방어적으로 동작
-    11) 장기 운용 중 size drift가 커지지 않도록 precision 정규화
-    12) over-sizing 보다 under-sizing 을 우선하는 보수적 구조 유지
-    13) router / executor / position / pnl / kill switch 와 쉽게 연결 가능한 구조 유지
-    14) 심볼별 risk budget과 global cap을 동시에 적용
-    15) leverage 적용 후 실제 required margin 기준으로 재검증
-    16) 수년간 튜닝 없이 굴려도 안정적인 sizing layer 유지
+    핵심 보강:
+    1) capital mode / runtime risk_per_trade / leverage_cap 반영
+    2) 초소액 계좌에서 과대진입 방지
+    3) exchange min notional은 지키되, equity 비례 최소진입 과도 확대 제거
+    4) CLOSE / PARTIAL_CLOSE / OPEN 구조 유지
+    5) 기존 debug payload / meta 응답 유지
     """
 
     def __init__(self):
         self.base_risk = float(CAPITAL_PER_TRADE)
-        self.exchange_min_notional = 2.0
+        self.risk_per_trade = float(CAPITAL_PER_TRADE)
+        self.exchange_min_notional = float(SIZING_EXCHANGE_MIN_NOTIONAL)
 
-        self.min_signal_multiplier = 0.80
-        self.max_signal_multiplier = 1.80
+        self.min_signal_multiplier = float(SIZING_MIN_SIGNAL_MULTIPLIER)
+        self.max_signal_multiplier = float(SIZING_MAX_SIGNAL_MULTIPLIER)
 
-        self.min_volatility_floor = 0.0005
-        self.max_volatility_cap = 0.08
+        self.min_volatility_floor = float(SIZING_MIN_VOLATILITY_FLOOR)
+        self.max_volatility_cap = float(SIZING_MAX_VOLATILITY_CAP)
 
-        self.max_margin_usage_ratio = 0.85
-        self.free_balance_buffer_ratio = 0.05
+        self.max_margin_usage_ratio = float(SIZING_MAX_MARGIN_USAGE_RATIO)
+        self.free_balance_buffer_ratio = float(SIZING_FREE_BALANCE_BUFFER_RATIO)
 
         self.min_regime_multiplier = 0.68
         self.max_regime_multiplier = 1.22
@@ -210,11 +200,11 @@ class DynamicSizing:
             "BALANCED": 1.00,
             "NEUTRAL": 1.00,
             "MEAN_REVERSION": 0.90,
-            "RANGE": 0.88,
-            "CHOPPY": 0.72,
+            "RANGE": 0.94,
+            "CHOPPY": 0.76,
             "NOISE": 0.68,
             "PANIC": 0.58,
-            "HIGH_VOL": 0.70,
+            "HIGH_VOL": 0.72,
             "LOW_LIQUIDITY": 0.62,
             "ILLIQUID": 0.60,
             "RISK_OFF": 0.55,
@@ -325,6 +315,48 @@ class DynamicSizing:
             "drawdown_ratio": drawdown_ratio,
         }
 
+    def _extract_runtime_risk_per_trade(self, account_context: Optional[Dict[str, Any]]) -> float:
+        ctx = account_context or {}
+        val = self._safe_float(ctx.get("risk_per_trade"), self.risk_per_trade)
+        if val <= 0:
+            val = self.risk_per_trade
+        return self._clamp(val, 0.002, 0.05)
+
+    def _extract_runtime_leverage(self, account_context: Optional[Dict[str, Any]]) -> float:
+        ctx = account_context or {}
+        leverage_cap = self._safe_float(ctx.get("leverage_cap"), LEVERAGE)
+        if leverage_cap <= 0:
+            leverage_cap = LEVERAGE
+        return max(1.0, min(float(LEVERAGE), leverage_cap))
+
+    def _extract_capital_mode(self, account_context: Optional[Dict[str, Any]]) -> str:
+        ctx = account_context or {}
+        return str(ctx.get("capital_mode", "UNKNOWN")).upper().strip()
+
+    def _capital_mode_multiplier(self, capital_mode: str) -> float:
+        mapping = {
+            "SURVIVAL": 0.92,
+            "MICRO_COMPOUND": 1.00,
+            "ADAPTIVE_GROWTH": 1.06,
+            "DEFENSIVE": 0.78,
+            "CAPITAL_PRESERVATION": 0.86,
+            "UNKNOWN": 0.95,
+        }
+        return mapping.get(capital_mode, 0.95)
+
+    def _small_account_hard_cap_ratio(self, equity: float, capital_mode: str) -> float:
+        if capital_mode == "SURVIVAL":
+            return 0.20
+        if capital_mode == "DEFENSIVE":
+            return 0.16
+        if equity < 50:
+            return 0.22
+        if equity < 200:
+            return 0.27
+        if equity < 1000:
+            return 0.35
+        return float(MAX_POSITION_SIZE)
+
     def _extract_position_size(self, current_position: Any) -> float:
         if current_position is None:
             return 0.0
@@ -358,16 +390,6 @@ class DynamicSizing:
                 return val
         return 0.0
 
-    def _apply_precision_and_validate(self, symbol: str, raw_size: float, price: float) -> float:
-        step = self._step_for_symbol(symbol)
-        min_qty = self._min_qty_for_symbol(symbol)
-        size = self._precision_floor(max(0.0, raw_size), step)
-        if size < min_qty:
-            return 0.0
-        if price > 0 and (size * price) < self.exchange_min_notional:
-            return 0.0
-        return size
-
     def _build_sizing_debug_payload(
         self,
         symbol: str,
@@ -382,6 +404,9 @@ class DynamicSizing:
         drawdown_mult: float,
         execution_mult: float,
         confidence_mult: float,
+        capital_mode: str,
+        capital_mode_mult: float,
+        runtime_leverage: float,
         position_value: float,
         leveraged_value: float,
         raw_size: float,
@@ -402,6 +427,9 @@ class DynamicSizing:
             "drawdown_mult": drawdown_mult,
             "execution_mult": execution_mult,
             "confidence_mult": confidence_mult,
+            "capital_mode": capital_mode,
+            "capital_mode_mult": capital_mode_mult,
+            "runtime_leverage": runtime_leverage,
             "position_value": position_value,
             "leveraged_value": leveraged_value,
             "raw_size": raw_size,
@@ -432,7 +460,6 @@ class DynamicSizing:
         signal_meta = signal_meta or {}
         _ = kwargs
 
-    # 기존 로직 그대로
         try:
             symbol = self._normalize_symbol(symbol)
             action = self._normalize_action(action)
@@ -451,6 +478,11 @@ class DynamicSizing:
             free_balance = self._safe_float(balance_ctx.get("free_balance"), balance)
             drawdown_ratio = self._safe_float(balance_ctx.get("drawdown_ratio"), 0.0)
             margin_ratio = self._safe_float(balance_ctx.get("margin_ratio"), 0.0)
+
+            runtime_risk_per_trade = self._extract_runtime_risk_per_trade(account_context)
+            runtime_leverage = self._extract_runtime_leverage(account_context)
+            capital_mode = self._extract_capital_mode(account_context)
+            capital_mode_mult = self._capital_mode_multiplier(capital_mode)
 
             current_position_size = self._extract_position_size(current_position)
 
@@ -478,12 +510,16 @@ class DynamicSizing:
                     return 0.0
 
                 final_notional = size * price
-                if size <= 0 or final_notional < self.exchange_min_notional * (self.min_partial_close_notional_ratio if action == "PARTIAL_CLOSE" else 1.0):
+                min_notional = self.exchange_min_notional * (
+                    self.min_partial_close_notional_ratio if action == "PARTIAL_CLOSE" else 1.0
+                )
+                if size <= 0 or final_notional < min_notional:
                     return 0.0
+
                 return size
 
             # ===== OPEN =====
-            risk_capital = equity * self.base_risk
+            risk_capital = equity * runtime_risk_per_trade
             if risk_capital <= 0:
                 logging.warning(f"[SIZING_SKIP] risk_capital<=0 | symbol={symbol} risk_capital={risk_capital}")
                 return 0.0
@@ -504,50 +540,65 @@ class DynamicSizing:
                 * drawdown_mult
                 * execution_mult
                 * confidence_mult
+                * capital_mode_mult
             )
 
-            # 최소 진입 노셔널 보정
+            # 초소액 구간 보정
+            if equity < 50:
+                position_value *= 0.86
+            elif equity < 200:
+                position_value *= 0.92
+
+            # 최소 진입 노셔널은 거래소 조건 + 아주 작은 완충만 허용
             dynamic_min_notional = max(
                 self.exchange_min_notional,
-                equity * 0.08
+                min(5.0, equity * 0.03)
             )
             if position_value < dynamic_min_notional:
                 position_value = dynamic_min_notional
 
-            max_value_global = equity * float(MAX_POSITION_SIZE) * self.max_position_value_cap_ratio
+            # 소액 계좌용 하드캡
+            hard_cap_ratio = self._small_account_hard_cap_ratio(equity, capital_mode)
+            max_value_global = equity * hard_cap_ratio * self.max_position_value_cap_ratio
             max_value_symbol = max_value_global * self._symbol_cap_multiplier(symbol)
 
             current_position_value = current_position_size * price
             remaining_symbol_capacity = max(0.0, max_value_symbol - current_position_value)
             position_value = min(position_value, remaining_symbol_capacity)
 
-            # margin ratio가 이미 높으면 공격적 증액 차단
+            if position_value <= 0:
+                logging.warning(f"[SIZING_SKIP] no remaining symbol capacity | symbol={symbol}")
+                return 0.0
+
+            # margin ratio가 이미 높으면 차단
             if margin_ratio >= self.max_margin_usage_ratio:
                 logging.warning(
-                    f"[SIZING_SKIP] margin ratio exceeded | symbol={symbol} margin_ratio={margin_ratio:.4f} max={self.max_margin_usage_ratio:.4f}"
+                    f"[SIZING_SKIP] margin ratio exceeded | symbol={symbol} "
+                    f"margin_ratio={margin_ratio:.4f} max={self.max_margin_usage_ratio:.4f}"
                 )
                 return 0.0
 
-            leveraged_value = position_value * float(LEVERAGE)
-            required_margin = leveraged_value / max(float(LEVERAGE), 1e-9)
+            leveraged_value = position_value * runtime_leverage
+            required_margin = leveraged_value / max(runtime_leverage, 1e-9)
 
             if required_margin > equity * self.max_margin_usage_ratio:
                 logging.warning(
-                    f"[SIZING_SKIP] margin too high | symbol={symbol} required_margin={required_margin:.4f} equity={equity:.4f}"
+                    f"[SIZING_SKIP] margin too high | symbol={symbol} "
+                    f"required_margin={required_margin:.4f} equity={equity:.4f}"
                 )
                 return 0.0
 
-            # available balance보다 약간 공격적으로 허용
             if required_margin > (available_balance * 0.98):
                 logging.warning(
-                    f"[SIZING_SKIP] available balance insufficient | symbol={symbol} required_margin={required_margin:.4f} available_balance={available_balance:.4f}"
+                    f"[SIZING_SKIP] available balance insufficient | symbol={symbol} "
+                    f"required_margin={required_margin:.4f} available_balance={available_balance:.4f}"
                 )
                 return 0.0
 
             if (free_balance - required_margin) < (equity * self.free_balance_buffer_ratio):
                 logging.warning(
-                    f"[SIZING_SKIP] free balance buffer violated | symbol={symbol} required_margin={required_margin:.4f} "
-                    f"free_balance={free_balance:.4f} equity={equity:.4f}"
+                    f"[SIZING_SKIP] free balance buffer violated | symbol={symbol} "
+                    f"required_margin={required_margin:.4f} free_balance={free_balance:.4f} equity={equity:.4f}"
                 )
                 return 0.0
 
@@ -566,18 +617,23 @@ class DynamicSizing:
 
             if size < min_qty:
                 logging.warning(
-                    f"[SIZING_SKIP] size below min_qty | symbol={symbol} raw_size={raw_size:.6f} adjusted={size:.6f} min_qty={min_qty}"
+                    f"[SIZING_SKIP] size below min_qty | symbol={symbol} "
+                    f"raw_size={raw_size:.6f} adjusted={size:.6f} min_qty={min_qty}"
                 )
                 return 0.0
 
             final_notional = size * price
             if final_notional < self.exchange_min_notional:
                 logging.warning(
-                    f"[SIZING_SKIP] final_notional too low | symbol={symbol} size={size:.6f} price={price:.6f} final_notional={final_notional:.6f}"
+                    f"[SIZING_SKIP] final_notional too low | symbol={symbol} "
+                    f"size={size:.6f} price={price:.6f} final_notional={final_notional:.6f}"
                 )
                 return 0.0
 
-            max_final_size = self._precision_floor(max(0.0, (remaining_symbol_capacity * float(LEVERAGE)) / price), step)
+            max_final_size = self._precision_floor(
+                max(0.0, (remaining_symbol_capacity * runtime_leverage) / price),
+                step,
+            )
             if max_final_size > 0:
                 size = min(size, max_final_size)
                 size = self._precision_floor(size, step)
@@ -599,6 +655,9 @@ class DynamicSizing:
                 drawdown_mult=drawdown_mult,
                 execution_mult=execution_mult,
                 confidence_mult=confidence_mult,
+                capital_mode=capital_mode,
+                capital_mode_mult=capital_mode_mult,
+                runtime_leverage=runtime_leverage,
                 position_value=position_value,
                 leveraged_value=leveraged_value,
                 raw_size=raw_size,
@@ -615,6 +674,8 @@ class DynamicSizing:
                 f"vol_value={debug_payload['vol_value']:.6f} vol_mult={debug_payload['vol_mult']:.4f} "
                 f"regime_mult={debug_payload['regime_mult']:.4f} drawdown_mult={debug_payload['drawdown_mult']:.4f} "
                 f"execution_mult={debug_payload['execution_mult']:.4f} confidence_mult={debug_payload['confidence_mult']:.4f} "
+                f"capital_mode={debug_payload['capital_mode']} capital_mode_mult={debug_payload['capital_mode_mult']:.4f} "
+                f"runtime_leverage={debug_payload['runtime_leverage']:.2f} "
                 f"position_value={debug_payload['position_value']:.4f} leveraged_value={debug_payload['leveraged_value']:.4f} "
                 f"raw_size={debug_payload['raw_size']:.6f} final_size={debug_payload['final_size']:.6f} "
                 f"current_position_size={debug_payload['current_position_size']:.6f} required_margin={debug_payload['required_margin']:.6f}"
@@ -664,6 +725,7 @@ class DynamicSizing:
             side = self._normalize_side(side)
             px = self._extract_price(price, market_context)
             notional = size * px if size > 0 and px > 0 else 0.0
+            runtime_leverage = self._extract_runtime_leverage(account_context)
 
             return {
                 "symbol": symbol,
@@ -673,7 +735,7 @@ class DynamicSizing:
                 "qty": size,
                 "price": px,
                 "notional": notional,
-                "leverage": float(LEVERAGE),
+                "leverage": runtime_leverage,
                 "valid": size > 0,
                 "debug": copy.deepcopy(self.last_debug_payload.get(symbol, {})),
             }

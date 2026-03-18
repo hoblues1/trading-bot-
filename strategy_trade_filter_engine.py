@@ -19,8 +19,8 @@ class TradeFilterEngine:
         self,
         min_score: float = 0.32,
         min_confidence: float = 0.30,
-        signal_accept_cooldown_seconds: float = 1.2,
-        reject_cooldown_seconds: float = 0.35,
+        signal_accept_cooldown_seconds: float = 0.90,
+        reject_cooldown_seconds: float = 0.20,
         block_sources=None,
         blocked_regimes=None,
         allowed_regimes=None,
@@ -31,7 +31,7 @@ class TradeFilterEngine:
         self.reject_cooldown_seconds = float(reject_cooldown_seconds)
 
         self.block_sources = set(block_sources or [])
-        self.blocked_regimes = set(blocked_regimes or {"NO_TRADE", "NOISE", "FLAT", "BLOCKED"})
+        self.blocked_regimes = set(blocked_regimes or {"NO_TRADE", "BLOCKED", "SHOCK", "LOW_LIQUIDITY"})
         self.allowed_regimes = set(allowed_regimes or [])
 
         self.last_accept_ts: Dict[str, float] = {}
@@ -69,8 +69,13 @@ class TradeFilterEngine:
             return regime
 
         if isinstance(regime, dict):
+            label = self._extract_regime_label(regime)
+            if label in {"WARMUP", "SHOCK", "LOW_LIQUIDITY"}:
+                return False
+
             if "allow_trade" in regime:
-                return bool(regime["allow_trade"])
+                if bool(regime["allow_trade"]) is False and label not in {"RANGE", "TREND_UP", "TREND_DOWN", "TREND"}:
+                    return False
 
         label = self._extract_regime_label(regime)
         if label is None:
@@ -156,7 +161,7 @@ class TradeFilterEngine:
             signal.get("weighted_score", signal.get("score", signal.get("strength", 0.0))),
             0.0,
         )
-        confidence = self._safe_float(signal.get("confidence", 0.0), 0.0)
+        confidence = self._safe_float(signal.get("confidence", signal.get("quality", 0.0)), 0.0)
 
         alpha = self._safe_float(signal.get("alpha", signal.get("signal", 0.0)), 0.0)
 
@@ -190,14 +195,14 @@ class TradeFilterEngine:
             return False
 
         # ===== 3. regime 필터 =====
-        if regime_label in {"CHOP", "RANGE", "NOISE", "FLAT", "BLOCKED", "NO_TRADE"}:
+        if regime_label in {"WARMUP", "SHOCK", "LOW_LIQUIDITY", "BLOCKED", "NO_TRADE"}:
             return False
 
         # ===== 4. regime 방향 일치 =====
         if regime_direction:
-            if side == "BUY" and regime_direction not in {"UP", "LONG"}:
+            if side == "BUY" and regime_direction not in {"UP", "LONG", ""}:
                 return False
-            if side == "SELL" and regime_direction not in {"DOWN", "SHORT"}:
+            if side == "SELL" and regime_direction not in {"DOWN", "SHORT", ""}:
                 return False
 
         # ===== 5. micro 타이밍 품질 =====
